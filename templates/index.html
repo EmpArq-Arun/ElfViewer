@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Linker MemMap</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<header>
+  <h1>Linker <em>MemMap</em></h1>
+  <span class="chip">Analyser</span>
+  <span class="chip blu" id="fchip" style="display:none">📋 <span id="fname"></span></span>
+  <span class="chip pur" id="echip" style="display:none">⚙️ <span id="ename"></span></span>
+  <span class="chip ora" id="mchip" style="display:none">🗺 <span id="mname"></span></span>
+  <span class="chip grn" id="entry-chip" style="display:none">⚡ <span id="esym"></span></span>
+  <span class="chip grn" id="sym-chip"   style="display:none"><span id="symcount"></span> symbols</span>
+  <div class="spacer"></div>
+  <button class="hbtn" id="feat-toggle-btn" onclick="toggleFeatures()">⚙ Features</button>
+  <button class="hbtn" onclick="toggleSidebar()">☰ Files</button>
+</header>
+
+<!-- ── Layout ── -->
+<div class="layout">
+
+  <!-- ── Sidebar ── -->
+  <div class="sidebar" id="sidebar">
+
+    <!-- LD drop -->
+    <div class="sb-sec">
+      <div class="sb-title">
+        <span class="req-dot ld">LD</span> Linker Script
+      </div>
+      <input type="file" accept=".ld,.lds,.x" id="ld-fi" style="display:none">
+      <div class="drop-area" id="ld-drop">
+        <div class="dico">📋</div>
+        <p>Drop .ld file<br>or click to browse</p>
+      </div>
+      <div class="fname" id="ld-name" style="display:none"></div>
+    </div>
+
+    <!-- ELF drop -->
+    <div class="sb-sec">
+      <div class="sb-title">
+        <span class="req-dot elf">ELF</span> Binary
+      </div>
+      <input type="file" id="elf-fi" style="display:none">
+      <div class="drop-area" id="elf-drop">
+        <div class="dico">⚙️</div>
+        <p>Drop .elf / .axf<br>for symbol analysis</p>
+      </div>
+      <div class="fname" id="elf-name" style="display:none"></div>
+      <progress id="elf-prog" max="100"></progress>
+    </div>
+
+    <!-- Map drop -->
+    <div class="sb-sec">
+      <div class="sb-title">
+        <span class="req-dot map">MAP</span> Linker Map
+      </div>
+      <input type="file" accept=".map" id="map-fi" style="display:none">
+      <div class="drop-area" id="map-drop">
+        <div class="dico">🗺</div>
+        <p>Drop .map file<br>for per-file breakdown</p>
+      </div>
+      <div class="fname" id="map-name" style="display:none"></div>
+    </div>
+
+    <!-- Toolchain -->
+    <div class="sb-sec">
+      <div class="sb-title"><span class="req-dot elf">ELF</span> Toolchain</div>
+      <div class="tool-row">
+        <label>Prefix path (replaces fields below)</label>
+        <input id="t-prefix" placeholder="e.g. D:\NXP\bin\arm-none-eabi-">
+      </div>
+      <div class="tool-row"><label>nm</label>
+        <input id="t-nm" value="arm-none-eabi-nm"></div>
+      <div class="tool-row"><label>readelf</label>
+        <input id="t-re" value="arm-none-eabi-readelf"></div>
+      <div class="tool-row"><label>size</label>
+        <input id="t-sz" value="arm-none-eabi-size"></div>
+      <div class="tool-row"><label>addr2line</label>
+        <input id="t-a2l" value="arm-none-eabi-addr2line"></div>
+      <button class="run-btn" id="analyse-btn" onclick="runAnalysis()" disabled>▶ Analyse ELF</button>
+      <div id="tool-status"></div>
+    </div>
+
+    <!-- Features panel -->
+    <div class="sb-sec feat-panel" id="feat-panel" style="display:none">
+      <div class="sb-title" style="margin-bottom:6px">⚙ Features</div>
+      <div id="feat-groups"></div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- ── Main content ── -->
+  <div class="main" id="main">
+
+    <!-- Welcome -->
+    <div class="empty" id="welcome">
+      <div class="eico">🗂️</div>
+      <h3>Drop any combination of files to begin</h3>
+      <p>📋 <strong>.ld</strong> — memory map, section layout, region sizes<br>
+         ⚙️ <strong>.elf</strong> — symbols, sizes, DMA warnings, addr→line<br>
+         🗺 <strong>.map</strong> — per-file flash/RAM, contributors, GC'd sections<br><br>
+         Each file is optional. All three together gives the complete picture.<br>
+         Click any row, section, or region for a detailed popup.</p>
+    </div>
+
+    <!-- App -->
+    <div id="app" style="display:none">
+      <div class="tabs" id="tabs">
+        <div class="tab act" data-pane="map"   onclick="tab(this)">🗺 Memory Map</div>
+        <div class="tab"     data-pane="sec"   onclick="tab(this)">📦 Sections</div>
+        <div class="tab"     data-pane="sym"   onclick="tab(this)">🔍 Symbols</div>
+        <div class="tab"     data-pane="warn"  onclick="tab(this)">⚠ Warnings <span class="badge" id="warn-badge" style="display:none"></span></div>
+        <div class="tab"     data-pane="bloat" onclick="tab(this)">💾 Bloat</div>
+        <div class="tab"     data-pane="start" onclick="tab(this)">🚀 Startup</div>
+        <div class="tab"     data-pane="map2"  onclick="tab(this)">📂 Map File</div>
+        <div class="tab"     data-pane="dead"  onclick="tab(this)">🗑 Dead Code</div>
+        <div class="tab"     data-pane="a2l"   onclick="tab(this)">📍 Addr→Line</div>
+        <div class="tab"     data-pane="dbg"   onclick="tab(this)">🐛 Debug</div>
+      </div>
+
+      <!-- MEMORY MAP -->
+      <div class="pane act" id="pane-map">
+        <div id="mc"><svg id="map-svg"></svg></div>
+        <div id="leg"></div>
+        <div class="card-wrap">
+          <div class="tbl-hdr">Region Summary</div>
+          <table><thead><tr>
+            <th>Region</th><th>Origin</th><th>End</th><th>Size</th>
+            <th>Type</th><th>Used</th><th>Free</th><th>Fill</th><th>Sections</th>
+          </tr></thead><tbody id="rtb"></tbody></table>
+        </div>
+      </div>
+
+      <!-- SECTIONS -->
+      <div class="pane" id="pane-sec">
+        <div class="filter-bar">
+          <input class="search" id="sec-q" placeholder="Filter sections…" oninput="filterSecs()">
+          <select class="fsel" id="sec-type" onchange="filterSecs()">
+            <option value="">All types</option>
+          </select>
+          <span class="cnt" id="sec-cnt"></span>
+        </div>
+        <div class="sec-grid" id="sec-grid"></div>
+      </div>
+
+      <!-- SYMBOLS -->
+      <div class="pane" id="pane-sym">
+        <div class="empty" id="sym-empty">
+          <div class="eico">⚙️</div><h3>Load an ELF to explore symbols</h3>
+          <p>Drop a .elf / .axf and click <strong>Analyse ELF</strong>.</p>
+        </div>
+        <div id="sym-content" style="display:none">
+          <div class="filter-bar">
+            <input class="search" id="sym-q" placeholder="Search symbols…" oninput="filterSyms()">
+            <select class="fsel" id="sym-t" onchange="filterSyms()">
+              <option value="">All types</option>
+              <option value="function">Functions</option>
+              <option value="variable">Variables</option>
+              <option value="constant">Constants</option>
+              <option value="weak">Weak</option>
+              <option value="undefined">Undefined</option>
+            </select>
+            <select class="fsel" id="sym-s" onchange="filterSyms()">
+              <option value="">All sections</option>
+            </select>
+            <select class="fsel" id="sym-f" onchange="filterSyms()">
+              <option value="">All files</option>
+            </select>
+            <select class="fsel" id="sym-g" onchange="filterSyms()">
+              <option value="">Global+Local</option>
+              <option value="1">Global only</option>
+              <option value="0">Local only</option>
+            </select>
+            <span class="cnt" id="sym-cnt"></span>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">
+              Symbols
+              <div class="tbl-actions">
+                <button class="hbtn" onclick="exportSymbols()">⬇ CSV</button>
+              </div>
+            </div>
+            <table id="sym-tbl"><thead><tr>
+              <th onclick="sortSym('name')">Symbol</th>
+              <th onclick="sortSym('addr')">Address</th>
+              <th onclick="sortSym('size')">Size</th>
+              <th onclick="sortSym('type')">Type</th>
+              <th onclick="sortSym('section')">Section</th>
+              <th onclick="sortSym('file')">File</th>
+            </tr></thead><tbody id="sym-body"></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- WARNINGS -->
+      <div class="pane" id="pane-warn">
+        <div class="filter-bar">
+          <select class="fsel" id="warn-lvl" onchange="filterWarns()">
+            <option value="">All levels</option>
+            <option value="error">Errors only</option>
+            <option value="warn">Warnings only</option>
+            <option value="info">Info only</option>
+          </select>
+          <select class="fsel" id="warn-cat" onchange="filterWarns()">
+            <option value="">All categories</option>
+          </select>
+          <span class="cnt" id="warn-cnt"></span>
+        </div>
+        <div class="warn-list" id="warn-list"></div>
+      </div>
+
+      <!-- BLOAT -->
+      <div class="pane" id="pane-bloat">
+        <div class="empty" id="bloat-empty">
+          <div class="eico">💾</div><h3>Load ELF or Map for bloat analysis</h3>
+          <p>Shows largest functions, variables, and per-library flash usage.</p>
+        </div>
+        <div id="bloat-content" style="display:none">
+          <div class="sg" id="bloat-stats"></div>
+          <div id="bloat-treemap-wrap" class="card-wrap" style="display:none">
+            <div class="tbl-hdr">Flash by library / object file <span class="sub">(click cell to filter symbols)</span></div>
+            <div class="treemap" id="bloat-treemap" style="padding:12px;min-height:140px"></div>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">Largest functions <span class="sub">click row for details</span></div>
+            <table><thead><tr>
+              <th onclick="sortBloat('fn','name')">Function</th>
+              <th onclick="sortBloat('fn','size')">Size</th>
+              <th onclick="sortBloat('fn','section')">Section</th>
+              <th onclick="sortBloat('fn','file')">File</th>
+            </tr></thead><tbody id="bloat-fn"></tbody></table>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">Largest variables <span class="sub">click row for details</span></div>
+            <table><thead><tr>
+              <th onclick="sortBloat('var','name')">Variable</th>
+              <th onclick="sortBloat('var','size')">Size</th>
+              <th onclick="sortBloat('var','section')">Section</th>
+              <th onclick="sortBloat('var','file')">File</th>
+            </tr></thead><tbody id="bloat-var"></tbody></table>
+          </div>
+          <div class="card-wrap" id="dup-card" style="display:none">
+            <div class="tbl-hdr">Duplicate symbol names <span class="sub">same name, multiple object files</span></div>
+            <table><thead><tr><th>Symbol</th><th>Count</th><th>Files</th></tr></thead>
+            <tbody id="bloat-dup"></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- STARTUP -->
+      <div class="pane" id="pane-start">
+        <div class="sg" id="start-stats"></div>
+        <div class="card-wrap">
+          <div class="tbl-hdr">Copy table — what startup code does before main()</div>
+          <div style="padding:12px" id="start-rows"></div>
+        </div>
+      </div>
+
+      <!-- MAP FILE -->
+      <div class="pane" id="pane-map2">
+        <div class="empty" id="map2-empty">
+          <div class="eico">📂</div><h3>Drop a .map file to see per-file breakdown</h3>
+          <p>Shows which .o/.a files contribute to each section,<br>GC'd sections, fill bytes, and library breakdown.</p>
+        </div>
+        <div id="map2-content" style="display:none">
+          <div class="sg" id="map2-stats"></div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">Flash + RAM by object file
+              <span class="sub">click row to filter symbols</span>
+              <div class="tbl-actions">
+                <button class="hbtn" onclick="exportMapCSV()">⬇ CSV</button>
+              </div>
+            </div>
+            <div class="filter-bar" style="padding:8px 12px 0;margin:0">
+              <input class="search" id="map2-q" placeholder="Filter files…" oninput="filterMapFiles()">
+              <select class="fsel" id="map2-lib" onchange="filterMapFiles()">
+                <option value="">All libraries</option>
+              </select>
+              <span class="cnt" id="map2-cnt"></span>
+            </div>
+            <table><thead><tr>
+              <th onclick="sortMap('file')">File</th>
+              <th onclick="sortMap('flash')">Flash</th>
+              <th onclick="sortMap('ram')">RAM</th>
+              <th onclick="sortMap('total')">Total</th>
+              <th>Bar</th>
+              <th>Symbols</th>
+            </tr></thead><tbody id="map2-tbody"></tbody></table>
+          </div>
+          <div class="card-wrap" id="sec-contrib-card">
+            <div class="tbl-hdr">Section contributors <span class="sub">which files fill each section</span></div>
+            <table><thead><tr>
+              <th>Section</th><th>Total size</th><th>Top contributors</th>
+            </tr></thead><tbody id="sec-contrib-body"></tbody></table>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">Discarded / GC'd sections
+              <span class="sub">removed by --gc-sections</span>
+            </div>
+            <table><thead><tr><th>Section</th><th>File</th></tr></thead>
+            <tbody id="map2-disc"></tbody>
+          </div>
+        </div>
+      </div>
+
+      <!-- DEAD CODE -->
+      <div class="pane" id="pane-dead">
+        <div class="empty" id="dead-empty">
+          <div class="eico">🗑</div><h3>Load a .map file to see dead code analysis</h3>
+          <p>Requires <code>--gc-sections</code> linker flag to be effective.</p>
+        </div>
+        <div id="dead-content" style="display:none">
+          <div class="sg" id="dead-stats"></div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">GC'd sections by file <span class="sub">click to see what was removed</span></div>
+            <table><thead><tr>
+              <th onclick="sortDead('file')">File</th>
+              <th onclick="sortDead('count')">Sections removed</th>
+              <th onclick="sortDead('size')">Est. bytes saved</th>
+            </tr></thead><tbody id="dead-tbody"></tbody></table>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">All discarded sections</div>
+            <div class="filter-bar" style="padding:8px 12px 0;margin:0">
+              <input class="search" id="dead-q" placeholder="Filter…" oninput="filterDead()">
+            </div>
+            <table><thead><tr><th>Section</th><th>File</th></tr></thead>
+            <tbody id="dead-all"></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ADDR2LINE -->
+      <div class="pane" id="pane-a2l">
+        <p style="color:var(--dim);font-size:12px;margin-bottom:10px">
+          Resolve any hex address to source file and line number.<br>
+          Click any symbol or section row to auto-fill.
+        </p>
+        <div class="a2l-inp">
+          <input id="a2l-addr" placeholder="0x00401234" onkeydown="if(event.key==='Enter')doA2L()">
+          <button class="hbtn" onclick="doA2L()">Look up</button>
+        </div>
+        <div class="a2l-res" id="a2l-res">Result will appear here…</div>
+        <div style="margin-top:12px">
+          <div class="tbl-hdr" style="border-radius:var(--rad) var(--rad) 0 0">Recent lookups</div>
+          <div class="card-wrap" style="border-radius:0 0 var(--rad) var(--rad);margin:0">
+            <table><thead><tr><th>Address</th><th>Result</th></tr></thead>
+            <tbody id="a2l-history"></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- DEBUG -->
+      <div class="pane" id="pane-dbg">
+        <p style="color:var(--dim);font-size:12px;margin-bottom:10px">
+          Runs nm, readelf, and size on your ELF and shows exact output.<br>
+          Use when symbol count is 0 or tools cannot be found.
+        </p>
+        <button class="hbtn" onclick="runDebug()" style="margin-bottom:12px">🔬 Run diagnostics</button>
+        <div class="dbg-out" id="dbg-out">Click Run diagnostics with an ELF loaded.</div>
+      </div>
+
+    </div><!-- /app -->
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<!-- ── Popup Modal ── -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+  <div class="modal" id="modal">
+    <div class="modal-head">
+      <div class="modal-icon" id="modal-icon">📦</div>
+      <div>
+        <div class="modal-title" id="modal-title">Details</div>
+        <div class="modal-subtitle" id="modal-subtitle"></div>
+      </div>
+      <button class="modal-close" onclick="closeModalBtn()">✕</button>
+    </div>
+    <div class="modal-tabs" id="modal-tabs"></div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
+<footer>Linker MemMap · Drop files anywhere · Click anything for details</footer>
+
+
+<script src="/static/state.js"></script>
+<script src="/static/drops.js"></script>
+<script src="/static/render.js"></script>
+<script src="/static/tabs.js"></script>
+<script src="/static/popups.js"></script>
+<script src="/static/utils.js"></script>
+<script>
+// Boot — runs after all scripts are loaded
+document.addEventListener('DOMContentLoaded', function() {
+    loadFeatureState();
+    buildFeaturesPanel();
+    initDropZones();   // defined in drops.js
+    console.log('[boot] Linker MemMap ready');
+});
+</script>
+</html>
