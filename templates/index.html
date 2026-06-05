@@ -445,26 +445,75 @@
 
       <!-- STACK DEPTH -->
       <div class="pane" id="pane-stack">
-        <div id="stack-no-data" class="empty">
-          <div class="eico">🥞</div>
-          <h3>Stack depth analysis</h3>
-          <p>Requires GCC <code>-fstack-usage</code> flag during compilation.<br><br>
-            <strong style="color:var(--acc)">Add to your GCC flags:</strong>
-          </p>
-          <div style="background:var(--bg);border:1px solid var(--bdr);border-radius:var(--rad);padding:12px 16px;font-family:var(--mono);font-size:12px;color:var(--acc);text-align:left;margin:12px auto;white-space:pre;max-width:400px">-fstack-usage</div>
-          <p style="font-size:11px;max-width:520px;margin:0 auto">
-            Generates a <code>.su</code> file per .c file listing each function stack frame.<br>
-            In S32DS: <em>Project → Properties → C/C++ Build → Settings →<br>Compiler → Miscellaneous → Other flags</em><br><br>
-            After rebuilding, drop the .su files below.
-          </p>
-          <div style="margin-top:16px">
+        <!-- GCC flag instructions — always visible -->
+        <div class="card-wrap" style="margin-bottom:12px">
+          <div class="tbl-hdr">Setup — enable stack usage data in GCC</div>
+          <div style="padding:14px 16px;font-size:12px;color:#8b949e;line-height:1.8">
+            Add <code style="color:var(--acc);background:var(--bg);padding:1px 6px;border-radius:3px">-fstack-usage</code>
+            to your compiler flags. GCC generates a <code>.su</code> file alongside each <code>.o</code>.<br>
+            <strong style="color:#8b949e">In S32DS:</strong>
+            Project → Properties → C/C++ Build → Settings → Compiler → Miscellaneous → Other flags
+          </div>
+        </div>
+
+        <!-- File loader — always visible, works before and after data is loaded -->
+        <div class="card-wrap" style="margin-bottom:12px">
+          <div class="tbl-hdr">
+            Load .su files
+            <div class="tbl-actions">
+              <span class="cnt" id="su-file-count" style="margin-right:8px"></span>
+              <button class="hbtn" onclick="clearSUData()" id="su-clear-btn" style="display:none">✕ Clear all</button>
+            </div>
+          </div>
+          <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px">
+
+            <!-- Drop zone — always accessible -->
             <input type="file" id="su-fi" accept=".su" multiple style="display:none">
-            <div class="drop-area" id="su-drop" style="max-width:400px;margin:0 auto">
+            <div class="drop-area" id="su-drop">
               <div class="dico">📄</div>
-              <p>Drop .su files here (multiple OK)</p>
+              <p id="su-drop-label">Drop .su files here (multiple OK) — or click to browse</p>
+            </div>
+
+            <!-- Path scan section -->
+            <div style="border-top:1px solid var(--bdr);padding-top:10px">
+              <div style="font-size:11px;color:#8b949e;margin-bottom:6px">
+                Or scan a build directory for all .su files:
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <input id="su-path" class="search" style="flex:1;min-width:200px"
+                  placeholder="e.g. C:\S32DS_workspace\project\Debug"
+                  onkeydown="if(event.key==='Enter')scanSUPath()">
+                <button class="hbtn" onclick="scanSUPath()">🔍 Scan</button>
+              </div>
+              <div id="su-scan-status" style="font-size:11px;color:var(--dim);margin-top:5px"></div>
+            </div>
+
+            <!-- Scan results picker -->
+            <div id="su-picker" style="display:none;border-top:1px solid var(--bdr);padding-top:10px">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                <span style="font-size:12px;color:#fff" id="su-picker-title"></span>
+                <div style="display:flex;gap:6px">
+                  <button class="hbtn" onclick="suPickerSelectAll()">Select all</button>
+                  <button class="hbtn" onclick="suPickerSelectNone()">None</button>
+                  <button class="run-btn" style="width:auto;padding:5px 14px;margin:0"
+                    onclick="loadSelectedSU()">▶ Load selected</button>
+                </div>
+              </div>
+              <div id="su-picker-list" style="max-height:220px;overflow-y:auto;
+                background:var(--bg);border:1px solid var(--bdr);border-radius:var(--rad);padding:6px">
+              </div>
+            </div>
+
+            <!-- Loaded files list -->
+            <div id="su-loaded-list" style="display:none;border-top:1px solid var(--bdr);padding-top:10px">
+              <div style="font-size:11px;color:#8b949e;margin-bottom:5px">Loaded files:</div>
+              <div id="su-loaded-items"
+                style="display:flex;flex-wrap:wrap;gap:5px;max-height:100px;overflow-y:auto"></div>
             </div>
           </div>
         </div>
+
+        <!-- Results — shown once data is loaded -->
         <div id="stack-content" style="display:none">
           <div class="sg" id="stack-stats"></div>
           <div class="filter-bar">

@@ -214,6 +214,80 @@ def route_addr2line():
 
 # ── Server startup ────────────────────────────────────────────────────────
 
+@app.route('/scan_su', method='POST')
+def route_scan_su():
+    """Walk a directory tree and return all .su files found."""
+    response.content_type = 'application/json'
+    try:
+        path = request.forms.get('path', '').strip()
+        if not path:
+            return json.dumps({"error": "No path provided"})
+
+        # Expand user home dir and environment variables
+        path = os.path.expandvars(os.path.expanduser(path))
+
+        if not os.path.isdir(path):
+            return json.dumps({"error": f"Directory not found: {path}"})
+
+        files = []
+        for root, dirs, fnames in os.walk(path):
+            # Skip hidden dirs and common non-build dirs
+            dirs[:] = [d for d in dirs if not d.startswith('.')
+                       and d not in ('node_modules', '.git', '__pycache__')]
+            for fname in sorted(fnames):
+                if fname.endswith('.su'):
+                    full_path = os.path.join(root, fname)
+                    rel_dir   = os.path.relpath(root, path)
+                    files.append({
+                        "path": full_path,
+                        "name": fname,
+                        "dir":  rel_dir if rel_dir != '.' else '(root)',
+                        "size": os.path.getsize(full_path),
+                    })
+
+        # Sort: shallowest first, then alphabetical
+        files.sort(key=lambda f: (f['dir'].count(os.sep), f['name']))
+
+        return json.dumps({"files": files, "total": len(files)})
+
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
+
+
+@app.route('/load_su_files', method='POST')
+def route_load_su_files():
+    """Read the content of selected .su files and return them."""
+    response.content_type = 'application/json'
+    try:
+        paths = json.loads(request.forms.get('paths', '[]'))
+        if not paths:
+            return json.dumps({"error": "No paths provided"})
+
+        files = []
+        errors = []
+        for path in paths:
+            path = os.path.expandvars(os.path.expanduser(path))
+            if not os.path.isfile(path):
+                errors.append(f"Not found: {path}")
+                continue
+            if not path.endswith('.su'):
+                errors.append(f"Not a .su file: {path}")
+                continue
+            try:
+                with open(path, 'r', errors='replace') as f:
+                    content = f.read()
+                files.append({"name": os.path.basename(path),
+                              "path": path, "content": content})
+            except Exception as e:
+                errors.append(f"{path}: {e}")
+
+        return json.dumps({"files": files, "errors": errors})
+
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
+
+
+
 def find_free_port(candidates):
     for port in candidates:
         try:
