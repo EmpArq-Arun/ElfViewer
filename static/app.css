@@ -437,3 +437,14 @@ progress::-moz-progress-bar      { background: var(--acc); border-radius: 2px; }
 .stack-dynamic { color:var(--ora);border-color:#5a3d1a;background:#100c05; }
 .stack-bounded { color:var(--acc);border-color:#1a3a6a;background:#0d1e33; }
 .stack-unbounded-row td { color:var(--red) !important; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CALL CHAIN TOOLTIP  —  wider than standard tooltip to fit SVG diagram
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* When the tip contains an SVG chain diagram, allow it to be wider */
+#tip { max-width: 340px; }
+#tip svg { display: block; }
+
+/* Chain cell in stack table — underlined dotted to signal interactivity */
+.chain-cell:hover { color: #79baff !important; }

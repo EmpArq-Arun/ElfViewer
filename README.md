@@ -49,6 +49,7 @@ Drop any combination of files — each is optional:
 | `.su`           | Per-.su Stack depth information              |
 | `.ci`           | Per-.ci Stack chain addition                 |
 
+**NOTE:** The ci parser format is VCG — Vienna Graph Format, not the text key-value format I assumed. GCC uses this for all -fcallgraph-info output
 
 ## Toolchain
 

@@ -1522,11 +1522,16 @@ function renderStackDepth() {
                         </div>
                     </td>
                     <td class="sz">${item.frame}</td>
-                    <td style="font-size:10px;color:var(--dim);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-                        title="${chain}">${chain}</td>
+                    <td class="chain-cell" style="font-size:10px;color:var(--acc);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:underline dotted;cursor:pointer">${chain}</td>
                     <td>${item.recursive
                         ? '<span class="stack-type-badge stack-dynamic">recursive</span>' : ''}</td>`;
-                tr.addEventListener('click', () => {
+                // Wire hover diagram + click popup on the chain cell
+                const chainCell = tr.querySelector('.chain-cell');
+                if (chainCell && item.path && item.path.length > 1) {
+                    attachChainInteraction(chainCell, item.path, item.func);
+                }
+                tr.addEventListener('click', e => {
+                    if (e.target.classList.contains('chain-cell')) return; // handled above
                     // Cross-tab: open symbol popup if ELF is loaded
                     const sym = findSymbol(item.func, null);
                     if (sym) openSymbolPopup(sym);
@@ -1638,10 +1643,16 @@ function sortAndRenderStack() {
             <td style="color:${wcCol};font-weight:${wc?'600':'400'}">${wcStr}</td>
             <td><span class="stack-type-badge ${typeClass}">${e.type}</span></td>
             <td class="dim" style="font-size:10px">${e.file}:${e.line}</td>
-            <td style="font-size:10px;color:var(--dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-                title="${chainStr}">${chainStr}</td>`;
+            <td class="chain-cell" style="font-size:10px;color:${chainStr?'var(--acc)':'var(--dim)'};max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${chainStr?'text-decoration:underline dotted;cursor:pointer':''}">${chainStr}</td>`;
 
-        tr.addEventListener('click', () => {
+        // Wire hover diagram on chain cell (if chain data available)
+        if (wc && wc.path && wc.path.length > 1) {
+            const chainCell = tr.querySelector('.chain-cell');
+            if (chainCell) attachChainInteraction(chainCell, wc.path, e.func);
+        }
+
+        tr.addEventListener('click', ev => {
+            if (ev.target.classList.contains('chain-cell')) return;
             // Link to ELF symbol popup when ELF is loaded
             const sym = findSymbol(e.func, null);
             if (sym) openSymbolPopup(sym);
@@ -1811,6 +1822,411 @@ async function inspectCIFormat() {
         if (out) out.textContent = report;
     } catch(e) {
         if (out) out.textContent = 'Request failed: ' + e.message;
+    }
+}
+
+// =============================================================================
+// CALL CHAIN FLOW DIAGRAM
+// =============================================================================
+//
+// Renders a vertical function flow diagram for a call chain path.
+// Used in two contexts:
+//   1. Hover tooltip  — lightweight floating preview
+//   2. Click popup    — persistent modal, snapshotable with browser screenshot
+//
+// Each node shows:
+//   • Function name
+//   • Own stack frame (bytes)
+//   • Running cumulative total at this point in the chain
+//   • Source file:line (if available from .ci data)
+//   • Stack type badge (static / dynamic / bounded)
+//
+// An arrow connects each node to the next, labelled with the caller's
+// contribution to the total.
+//
+// EMBEDDED ENGINEER NOTE:
+//   Read the diagram top-to-bottom = outermost caller → deepest callee.
+//   The cumulative total at each node = stack depth IF that function is
+//   the deepest point of execution.  The bottom node's cumulative total
+//   is the worst-case stack requirement for the entry function.
+// =============================================================================
+
+/**
+ * Build an SVG string for a vertical call chain flow diagram.
+ *
+ * @param {string[]} path   Function names in call order (outermost first)
+ * @param {object}   cg     SU_DATA.cgResult  (for per-node frame sizes)
+ * @param {object[]} suData SU_DATA.entries   (for type/file data)
+ * @param {object}   opts   {compact: bool, maxWidth: number}
+ * @returns {string}        SVG markup
+ */
+function buildChainSVG(path, cg, suData, opts = {}) {
+    const compact  = opts.compact  || false;
+    // maxWidth is a hint — we expand if names are longer
+    const hintW    = opts.maxWidth || 380;
+
+    // ── Gather per-node data ─────────────────────────────────────────────
+    const nodes = path.map(name => {
+        const wc    = cg?.worst_case?.[name];
+        const su    = suData.find(e => e.func === name);
+        const frame = wc?.frame ?? su?.size ?? 0;
+        const type  = su?.type  ?? 'static';
+        const file  = wc?.file  ?? su?.file ?? '';
+        const line  = wc?.line  ?? su?.line ?? 0;
+        return { name, frame, type, file, line };
+    });
+
+    // Cumulative stack at each step (top-down)
+    let cumulative = 0;
+    const cumulatives = nodes.map(n => { cumulative += n.frame; return cumulative; });
+
+    // ── Approximate text width (monospace, ~7.2px per char at 12px font) ─
+    // We use this to size the node wide enough that no name is ever clipped.
+    const CHAR_W_NAME = compact ? 6.8 : 7.2;   // px per character at name font size
+    const FRAME_BADGE = 52;                      // px reserved for "NNNNB" on the right
+    const PAD_L       = 18;                      // left padding (after accent bar)
+    const PAD_R       = 10;                      // right padding
+
+    // Find the minimum node width that fits the longest function name
+    const longestNamePx = Math.max(
+        ...nodes.map(n => n.name.length * CHAR_W_NAME),
+        120
+    );
+    // Also account for file:line text (smaller font, but can be long)
+    const longestLocPx = compact ? 0 : Math.max(
+        ...nodes.map(n => {
+            const loc = n.file + (n.line ? ':' + n.line : '');
+            return loc.length * 6.0;  // 9px font ≈ 6px per char
+        }), 0
+    );
+
+    const NODE_W = Math.max(
+        hintW - 20,                                      // caller's hint
+        longestNamePx + PAD_L + FRAME_BADGE + PAD_R,    // name fits
+        longestLocPx  + PAD_L + PAD_R                   // file:line fits
+    );
+
+    // SVG layout
+    const NODE_H  = compact ? 52 : 68;
+    const ARROW_H = compact ? 20 : 28;
+    const STEP_H  = NODE_H + ARROW_H;
+    const SVG_W   = NODE_W + 20;                        // +10px margin each side
+    const SVG_H   = nodes.length * STEP_H - ARROW_H + 24;
+    const X0      = 10;
+    const NS      = 'http://www.w3.org/2000/svg';
+
+    // ── Colour helpers ────────────────────────────────────────────────────
+    const frameCol = f =>
+        f > 1024 ? '#f85149' : f > 256 ? '#d29922' : '#3fb950';
+    const typeCol  = t =>
+        t.includes('dynamic') && !t.includes('bounded') ? '#f97316' :
+        t.includes('bounded')                            ? '#58a6ff' : '#3fb950';
+
+    let svg = `<svg xmlns="${NS}" width="${SVG_W}" height="${SVG_H}"
+        viewBox="0 0 ${SVG_W} ${SVG_H}">`;
+    svg += `<defs>
+      <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#444d56"/>
+      </marker>
+    </defs>`;
+
+    nodes.forEach((node, i) => {
+        const y      = i * STEP_H + 12;
+        const cx     = SVG_W / 2;
+        const fc     = frameCol(node.frame);
+        const tc     = typeCol(node.type);
+        const cum    = cumulatives[i];
+        const isLast = i === nodes.length - 1;
+
+        // ── Node background ───────────────────────────────────────────────
+        svg += `<rect x="${X0}" y="${y}" width="${NODE_W}" height="${NODE_H}"
+            rx="5" fill="${i === 0 ? '#0d2140' : '#0d1117'}"
+            stroke="${i === 0 ? '#3b82f6' : '#21262d'}" stroke-width="1"/>`;
+
+        // Left severity bar
+        svg += `<rect x="${X0}" y="${y}" width="4" height="${NODE_H}"
+            rx="2" fill="${fc}"/>`;
+
+        // ── Full function name — no truncation ────────────────────────────
+        // The node is sized to fit, so we never need to truncate.
+        // For very long C++ mangled names we split at '::' boundaries.
+        const nameLines = _wrapName(node.name, NODE_W - PAD_L - FRAME_BADGE - PAD_R, CHAR_W_NAME);
+        const nameFS    = compact ? 11 : 12;
+        const nameColor = i === 0 ? '#58a6ff' : '#ffffff';
+
+        if (nameLines.length === 1) {
+            svg += `<text x="${X0 + PAD_L}" y="${y + (compact ? 18 : 20)}"
+                font-family="JetBrains Mono,monospace"
+                font-size="${nameFS}" font-weight="600"
+                fill="${nameColor}">${_svgEsc(nameLines[0])}</text>`;
+        } else {
+            // Multi-line name using tspan
+            svg += `<text x="${X0 + PAD_L}" y="${y + (compact ? 13 : 15)}"
+                font-family="JetBrains Mono,monospace"
+                font-size="${nameFS}" font-weight="600" fill="${nameColor}">`;
+            nameLines.forEach((ln, li) => {
+                svg += `<tspan x="${X0 + PAD_L}" dy="${li === 0 ? 0 : nameFS + 2}">${_svgEsc(ln)}</tspan>`;
+            });
+            svg += '</text>';
+        }
+
+        if (!compact) {
+            // File:line — full path, never truncated (node is wide enough)
+            if (node.file) {
+                const loc = node.file + (node.line ? ':' + node.line : '');
+                const locY = nameLines.length > 1 ? y + 15 + nameLines.length * 14 : y + 33;
+                svg += `<text x="${X0 + PAD_L}" y="${locY}"
+                    font-family="JetBrains Mono,monospace"
+                    font-size="9" fill="#6e7681">${_svgEsc(loc)}</text>`;
+            }
+        }
+
+        // Frame size — right-aligned, never overlaps name because NODE_W accounts for it
+        svg += `<text x="${X0 + NODE_W - 8}" y="${y + (compact ? 18 : 20)}"
+            font-family="JetBrains Mono,monospace"
+            font-size="${compact ? 11 : 12}" font-weight="600"
+            fill="${fc}" text-anchor="end">${node.frame}B</text>`;
+
+        // Cumulative total — bottom right
+        svg += `<text x="${X0 + NODE_W - 8}" y="${y + NODE_H - 8}"
+            font-family="JetBrains Mono,monospace"
+            font-size="9" fill="${isLast ? fc : '#555d66'}"
+            text-anchor="end">Σ ${cum}B</text>`;
+
+        // Stack type — bottom left
+        svg += `<text x="${X0 + PAD_L}" y="${y + NODE_H - 8}"
+            font-family="JetBrains Mono,monospace"
+            font-size="9" fill="${tc}">${_svgEsc(node.type)}</text>`;
+
+        // ── Downward arrow ─────────────────────────────────────────────────
+        if (!isLast) {
+            const ay1 = y + NODE_H;
+            const ay2 = ay1 + ARROW_H - 4;
+            svg += `<line x1="${cx}" y1="${ay1}" x2="${cx}" y2="${ay2}"
+                stroke="#444d56" stroke-width="1.5" marker-end="url(#arr)"/>`;
+            svg += `<text x="${cx + 6}" y="${ay1 + ARROW_H / 2}"
+                font-family="JetBrains Mono,monospace"
+                font-size="9" fill="#444d56">calls</text>`;
+        }
+    });
+
+    svg += '</svg>';
+    return { svg, totalBytes: cumulatives[cumulatives.length - 1] || 0, nodeCount: nodes.length, svgW: SVG_W };
+}
+
+/**
+ * Split a function name into lines that fit within maxPx width.
+ * Prefers splitting at C++ '::' and '_' boundaries.
+ * Returns array of line strings.
+ */
+function _wrapName(name, maxPx, charW) {
+    if (name.length * charW <= maxPx) return [name];   // fits on one line
+
+    const maxChars = Math.max(10, Math.floor(maxPx / charW));
+
+    // Try splitting at '::' first (C++ namespaces/classes)
+    const ccParts = name.split('::');
+    if (ccParts.length > 1) {
+        const lines = [];
+        let cur = '';
+        ccParts.forEach((part, i) => {
+            const sep = i < ccParts.length - 1 ? '::' : '';
+            if ((cur + part + sep).length <= maxChars) {
+                cur += part + sep;
+            } else {
+                if (cur) lines.push(cur);
+                cur = (i > 0 ? '  ' : '') + part + sep;  // indent continuations
+            }
+        });
+        if (cur) lines.push(cur);
+        if (lines.length > 1) return lines;
+    }
+
+    // Fall back to hard-wrap at maxChars, preferring '_' boundaries
+    const lines = [];
+    let remaining = name;
+    while (remaining.length > maxChars) {
+        // Find last '_' within maxChars
+        let cut = maxChars;
+        const lastUnderscore = remaining.lastIndexOf('_', maxChars);
+        if (lastUnderscore > maxChars * 0.5) cut = lastUnderscore + 1;
+        lines.push(remaining.slice(0, cut));
+        remaining = '  ' + remaining.slice(cut);   // indent continuation
+    }
+    if (remaining.trim()) lines.push(remaining);
+    return lines;
+}
+
+function _svgEsc(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+// ── Hover tooltip for chain cell ─────────────────────────────────────────────
+
+/**
+ * Attach hover + click behaviour to a chain-display element.
+ *
+ * @param {HTMLElement} el    The cell/span that shows the chain text
+ * @param {string[]}    path  Full call path (outermost → deepest)
+ * @param {string}      title Entry function name (for popup title)
+ */
+function attachChainInteraction(el, path, title) {
+    if (!path || path.length < 2) return;
+
+    const cg  = SU_DATA.cgResult;
+    const su  = SU_DATA.entries;
+
+    // ── Hover: custom SVG tooltip (not the generic addTip system) ────────
+    el.style.cursor = 'pointer';
+    el.title = '';   // suppress native title tooltip
+
+    let hoverTimeout;
+    el.addEventListener('mouseenter', e => {
+        hoverTimeout = setTimeout(() => {
+            const { svg, totalBytes } = buildChainSVG(path, cg, su, { compact: true, maxWidth: 300 });
+            const tip = getTip();
+            tip.innerHTML = `
+                <div class="tn" style="margin-bottom:8px">
+                    📊 ${_svgEsc(title)}
+                    <span style="color:var(--dim);font-size:10px;font-weight:400;margin-left:6px">
+                        worst-case: ${totalBytes}B — click to pin
+                    </span>
+                </div>
+                ${svg}
+                <div style="font-size:10px;color:var(--dim);margin-top:6px;border-top:1px solid var(--bdr);padding-top:5px">
+                    Click to open persistent popup · ${path.length} functions in chain
+                </div>`;
+            tip.classList.add('on');
+            tipPos(e);
+        }, 120);   // short delay prevents flicker when moving mouse across table
+    });
+    el.addEventListener('mousemove', e => { if (getTip().classList.contains('on')) tipPos(e); });
+    el.addEventListener('mouseleave', () => {
+        clearTimeout(hoverTimeout);
+        getTip().classList.remove('on');
+    });
+
+    // ── Click: persistent modal popup ────────────────────────────────────
+    el.addEventListener('click', e => {
+        e.stopPropagation();   // don't trigger row click (symbol popup)
+        getTip().classList.remove('on');
+        clearTimeout(hoverTimeout);
+        openChainPopup(path, title);
+    });
+}
+
+/**
+ * Open a persistent modal showing the full call chain flow diagram.
+ * The modal stays open until the user closes it, allowing screenshots.
+ *
+ * Layout:
+ *   Header:  entry function name + worst-case total
+ *   Body:    full-size vertical SVG flow diagram
+ *   Footer:  "Copy as text" + "Export SVG" buttons
+ */
+function openChainPopup(path, title) {
+    const cg  = SU_DATA.cgResult;
+    const su  = SU_DATA.entries;
+    const { svg, totalBytes, nodeCount } = buildChainSVG(path, cg, su, {
+        compact: false, maxWidth: 440
+    });
+
+    // Plain-text version for clipboard copy
+    let textChain = 'Call chain: ' + path.join(' → ') + '\n\n';
+    let cum = 0;
+    path.forEach((name, i) => {
+        const wc = cg?.worst_case?.[name];
+        const s  = su.find(e => e.func === name);
+        const f  = wc?.frame ?? s?.size ?? 0;
+        cum += f;
+        textChain += `${'  '.repeat(i)}${i > 0 ? '↳ ' : ''}${name}  (frame: ${f}B, cumulative: ${cum}B)\n`;
+    });
+    textChain += `\nWorst-case total: ${totalBytes}B`;
+
+    // Build a data URL so Copy as text works without async clipboard API issues
+    const textB64 = btoa(unescape(encodeURIComponent(textChain)));
+
+    const body = `
+        <div style="padding:18px 20px">
+            <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center">
+                <button class="hbtn" id="chain-copy-btn"
+                    onclick="(()=>{
+                        const txt = decodeURIComponent(escape(atob('${textB64}')));
+                        navigator.clipboard.writeText(txt)
+                            .then(()=>{this.textContent='✓ Copied!';setTimeout(()=>this.textContent='📋 Copy as text',2000)})
+                            .catch(()=>{this.textContent='Failed';setTimeout(()=>this.textContent='📋 Copy as text',2000)});
+                    })()">
+                    📋 Copy as text
+                </button>
+                <button class="hbtn" onclick="downloadChainSVG(this)">
+                    ⬇ Export SVG
+                </button>
+                <span style="font-size:11px;color:var(--dim)">
+                    ${nodeCount} functions · ${totalBytes}B worst-case
+                </span>
+                <span style="margin-left:auto;font-size:10px;color:var(--dim)">
+                    Ctrl+Shift+S or Print→PDF to snapshot
+                </span>
+            </div>
+            <div id="chain-svg-container"
+                style="background:#0d1117;border:1px solid var(--bdr);border-radius:var(--rad);
+                       padding:16px;overflow:auto;max-height:70vh;max-width:100%">
+                ${svg}
+            </div>
+        </div>`;
+
+    // Store path for SVG export
+    openChainPopup._lastPath  = path;
+    openChainPopup._lastTitle = title;
+
+    openModal(
+        '📊',
+        title,
+        `Worst-case stack chain · ${totalBytes} bytes · ${nodeCount} functions`,
+        [],        // no tabs — single pane
+        [body]
+    );
+}
+
+/**
+ * Export the current chain diagram as a standalone SVG file.
+ * Called from the button inside the popup.
+ */
+function downloadChainSVG(btn) {
+    const path  = openChainPopup._lastPath;
+    const title = openChainPopup._lastTitle;
+    if (!path) return;
+
+    // Build at generous width — no maxWidth constraint for export
+    // The _wrapName function auto-sizes the node, so names are never truncated
+    const { svg, totalBytes, svgW } = buildChainSVG(
+        path, SU_DATA.cgResult, SU_DATA.entries,
+        { compact: false, maxWidth: Math.max(520, svgW || 0) }
+    );
+
+    // Add a background rect so the SVG looks correct when opened standalone
+    // (browsers default to white background; we want dark)
+    const standalone = svg.replace(
+        '</defs>',
+        `</defs><rect width="100%" height="100%" fill="#0d1117"/>`
+    );
+
+    const blob = new Blob(
+        ['<' + '?xml version="1.0" encoding="UTF-8"?>\n', standalone],
+        { type: 'image/svg+xml' }
+    );
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = title.replace(/[^a-zA-Z0-9_]/g, '_') + '_stack_chain.svg';
+    a.click();
+
+    if (btn) {
+        btn.textContent = '✓ Downloaded';
+        setTimeout(() => btn.textContent = '⬇ Export SVG', 2000);
     }
 }
 
