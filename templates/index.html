@@ -2,6 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Linker MemMap</title>
 <link rel="stylesheet" href="/static/app.css">
@@ -121,7 +124,8 @@
         <div class="tab"     data-pane="start" onclick="tab(this)">🚀 Startup</div>
         <div class="tab"     data-pane="map2"  onclick="tab(this)">📂 Map File</div>
         <div class="tab"     data-pane="dead"  onclick="tab(this)">🗑 Dead Code</div>
-        <div class="tab"     data-pane="a2l"   onclick="tab(this)">📍 Addr→Line</div>
+        <div class="tab"     data-pane="a2l"   onclick="tab(this)">📍 Address Inspector</div>
+        <div class="tab"     data-pane="stack" onclick="tab(this)">🥞 Stack Depth</div>
         <div class="tab"     data-pane="dbg"   onclick="tab(this)">🐛 Debug</div>
       </div>
 
@@ -189,7 +193,8 @@
             </div>
             <table id="sym-tbl"><thead><tr>
               <th onclick="sortSym('name')">Symbol</th>
-              <th onclick="sortSym('addr')">Address</th>
+              <th onclick="sortSym('addr')">Start</th>
+              <th>End</th>
               <th onclick="sortSym('size')">Size</th>
               <th onclick="sortSym('type')">Type</th>
               <th onclick="sortSym('section')">Section</th>
@@ -339,20 +344,155 @@
 
       <!-- ADDR2LINE -->
       <div class="pane" id="pane-a2l">
-        <p style="color:var(--dim);font-size:12px;margin-bottom:10px">
-          Resolve any hex address to source file and line number.<br>
-          Click any symbol or section row to auto-fill.
-        </p>
-        <div class="a2l-inp">
-          <input id="a2l-addr" placeholder="0x00401234" onkeydown="if(event.key==='Enter')doA2L()">
-          <button class="hbtn" onclick="doA2L()">Look up</button>
+        <div class="addr-inspector">
+          <!-- Input bar -->
+          <div class="ai-input-row">
+            <div class="ai-input-wrap">
+              <span class="ai-prefix">0x</span>
+              <input id="a2l-addr" class="ai-input"
+                placeholder="address — e.g. 00401234 or 0x20400080"
+                onkeydown="if(event.key==='Enter')inspectAddress()"
+                oninput="onAddrInput(this)">
+            </div>
+            <button class="run-btn" style="width:auto;padding:8px 20px;margin:0"
+              onclick="inspectAddress()">🔍 Inspect</button>
+            <button class="hbtn" onclick="clearInspector()">✕ Clear</button>
+          </div>
+          <p class="ai-hint">
+            Paste any hex address — from a crash log, BFAR, PC, or symbol table.
+            Cross-references ELF symbols, LD sections, map file, and addr2line simultaneously.
+          </p>
+
+          <!-- Results panel — hidden until first lookup -->
+          <div id="ai-results" style="display:none">
+            <progress id="ai-progress" max="100" style="display:none;width:100%;height:4px;margin-bottom:8px;border-radius:2px;border:none;background:var(--s3)"></progress>
+            <div class="ai-banner" id="ai-banner"></div>
+
+            <!-- Four source cards in a grid -->
+            <div class="ai-grid">
+
+              <!-- Symbol card (from ELF nm) -->
+              <div class="ai-card" id="ai-sym-card">
+                <div class="ai-card-hdr">
+                  <span class="ai-card-icon">⚡</span>
+                  <span class="ai-card-title">Symbol  <span class="ai-src-badge elf">ELF</span></span>
+                </div>
+                <div class="ai-card-body" id="ai-sym-body">
+                  <span class="ai-na">Load ELF and click Analyse ELF</span>
+                </div>
+              </div>
+
+              <!-- Section / region card (from LD) -->
+              <div class="ai-card" id="ai-sec-card">
+                <div class="ai-card-hdr">
+                  <span class="ai-card-icon">📦</span>
+                  <span class="ai-card-title">Section &amp; Region  <span class="ai-src-badge ld">LD</span></span>
+                </div>
+                <div class="ai-card-body" id="ai-sec-body">
+                  <span class="ai-na">Load a .ld file</span>
+                </div>
+              </div>
+
+              <!-- Map file card -->
+              <div class="ai-card" id="ai-map-card">
+                <div class="ai-card-hdr">
+                  <span class="ai-card-icon">📂</span>
+                  <span class="ai-card-title">Object file  <span class="ai-src-badge map">MAP</span></span>
+                </div>
+                <div class="ai-card-body" id="ai-map-body">
+                  <span class="ai-na">Load a .map file</span>
+                </div>
+              </div>
+
+              <!-- addr2line card -->
+              <div class="ai-card" id="ai-a2l-card">
+                <div class="ai-card-hdr">
+                  <span class="ai-card-icon">📍</span>
+                  <span class="ai-card-title">Source line  <span class="ai-src-badge elf">addr2line</span></span>
+                </div>
+                <div class="ai-card-body" id="ai-a2l-body">
+                  <span class="ai-na">ELF needed — click Analyse ELF</span>
+                </div>
+              </div>
+
+            </div><!-- /ai-grid -->
+
+            <!-- Offset detail bar (shows position within symbol) -->
+            <div class="ai-offset-bar" id="ai-offset-bar" style="display:none">
+              <div class="ai-offset-track">
+                <div class="ai-offset-fill" id="ai-offset-fill"></div>
+                <div class="ai-offset-marker" id="ai-offset-marker"></div>
+              </div>
+              <div class="ai-offset-labels" id="ai-offset-labels"></div>
+            </div>
+
+          </div><!-- /ai-results -->
+
+          <!-- History -->
+          <div class="card-wrap" style="margin-top:14px">
+            <div class="tbl-hdr">
+              Recent inspections
+              <button class="hbtn" style="margin-left:auto;font-size:10px"
+                onclick="clearHistory()">Clear</button>
+            </div>
+            <table><thead><tr>
+              <th>Address</th><th>Symbol</th><th>Section</th><th>Source</th>
+            </tr></thead>
+            <tbody id="ai-history"></tbody></table>
+          </div>
         </div>
-        <div class="a2l-res" id="a2l-res">Result will appear here…</div>
-        <div style="margin-top:12px">
-          <div class="tbl-hdr" style="border-radius:var(--rad) var(--rad) 0 0">Recent lookups</div>
-          <div class="card-wrap" style="border-radius:0 0 var(--rad) var(--rad);margin:0">
-            <table><thead><tr><th>Address</th><th>Result</th></tr></thead>
-            <tbody id="a2l-history"></tbody></table>
+      </div>
+
+      <!-- STACK DEPTH -->
+      <div class="pane" id="pane-stack">
+        <div id="stack-no-data" class="empty">
+          <div class="eico">🥞</div>
+          <h3>Stack depth analysis</h3>
+          <p>Requires GCC <code>-fstack-usage</code> flag during compilation.<br><br>
+            <strong style="color:var(--acc)">Add to your GCC flags:</strong>
+          </p>
+          <div style="background:var(--bg);border:1px solid var(--bdr);border-radius:var(--rad);padding:12px 16px;font-family:var(--mono);font-size:12px;color:var(--acc);text-align:left;margin:12px auto;white-space:pre;max-width:400px">-fstack-usage</div>
+          <p style="font-size:11px;max-width:520px;margin:0 auto">
+            Generates a <code>.su</code> file per .c file listing each function stack frame.<br>
+            In S32DS: <em>Project → Properties → C/C++ Build → Settings →<br>Compiler → Miscellaneous → Other flags</em><br><br>
+            After rebuilding, drop the .su files below.
+          </p>
+          <div style="margin-top:16px">
+            <input type="file" id="su-fi" accept=".su" multiple style="display:none">
+            <div class="drop-area" id="su-drop" style="max-width:400px;margin:0 auto">
+              <div class="dico">📄</div>
+              <p>Drop .su files here (multiple OK)</p>
+            </div>
+          </div>
+        </div>
+        <div id="stack-content" style="display:none">
+          <div class="sg" id="stack-stats"></div>
+          <div class="filter-bar">
+            <input class="search" id="stack-q" placeholder="Filter functions…" oninput="filterStack()">
+            <select class="fsel" id="stack-type" onchange="filterStack()">
+              <option value="">All types</option>
+              <option value="static">Static (known at compile time)</option>
+              <option value="dynamic">Dynamic (uses alloca or VLAs)</option>
+              <option value="bounded">Bounded dynamic</option>
+            </select>
+            <span class="cnt" id="stack-cnt"></span>
+          </div>
+          <div class="card-wrap">
+            <div class="tbl-hdr">Function stack usage
+              <span class="sub">from -fstack-usage .su files</span>
+              <div class="tbl-actions"><button class="hbtn" onclick="exportStackCSV()">⬇ CSV</button></div>
+            </div>
+            <table><thead><tr>
+              <th onclick="sortStack('func')">Function</th>
+              <th onclick="sortStack('size')">Stack bytes</th>
+              <th onclick="sortStack('type')">Type</th>
+              <th onclick="sortStack('file')">File</th>
+            </tr></thead><tbody id="stack-tbody"></tbody></table>
+          </div>
+          <div class="card-wrap" id="stack-unbounded-card" style="display:none">
+            <div class="tbl-hdr" style="color:var(--red)">⚠ Unbounded stack — investigate these functions</div>
+            <table><thead><tr><th>Function</th><th>File</th></tr></thead>
+            <tbody id="stack-unbounded"></tbody></table>
           </div>
         </div>
       </div>
@@ -391,18 +531,14 @@
 <footer>Linker MemMap · Drop files anywhere · Click anything for details</footer>
 
 
-<script src="/static/state.js"></script>
-<script src="/static/drops.js"></script>
-<script src="/static/render.js"></script>
-<script src="/static/tabs.js"></script>
-<script src="/static/popups.js"></script>
-<script src="/static/utils.js"></script>
+<script src="/static/app.js?v=1780654538"></script>
 <script>
-// Boot — runs after all scripts are loaded
+// Boot — runs after all JS is loaded and DOM is ready
 document.addEventListener('DOMContentLoaded', function() {
     loadFeatureState();
     buildFeaturesPanel();
-    initDropZones();   // defined in drops.js
+    initDropZones();
+    initStackDrop();
     console.log('[boot] Linker MemMap ready');
 });
 </script>

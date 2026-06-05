@@ -97,7 +97,7 @@ function renderMap(){
     ],desc:'Click for detailed region view'});
 
     svgT(svg,hx(reg.origin),{x:AW-5,y:y+12,fill:'#58a6ff','font-size':9,'text-anchor':'end'});
-    svgT(svg,hx(reg.end),{x:AW-5,y:y+h,fill:'#3a4450','font-size':9,'text-anchor':'end'});
+    svgT(svg,hx(reg.end),{x:AW-5,y:y+h,fill:'#8b949e','font-size':9,'text-anchor':'end'});
     mkEl(svg,'line',{x1:AW-4,y1:y,x2:AW,y2:y,stroke:'#444','stroke-width':1});
     mkEl(svg,'line',{x1:AW-4,y1:y+h,x2:AW,y2:y+h,stroke:'#333','stroke-width':1});
     svgT(svg,reg.name,{x:AW+BW+10,y:y+14,fill:'#fff','font-size':12,'font-weight':600,'font-family':'Syne,sans-serif','pointer-events':'none'});
@@ -284,9 +284,11 @@ function sortAndRenderSyms(){
     const nameStyle=feat('f_symweak')&&s.type==='weak'?'color:#bc8cff':s.global?'color:#fff':'color:#8b949e';
     const tr=document.createElement('tr');tr.className='clickable';
     const fileCell=feat('f_symprov')&&s.file?s.file:'—';
+    const endAddr=s.size?hx(s.addr+s.size-1):'';
     tr.innerHTML=`
       <td style="${nameStyle};font-size:11px" title="${s.name}">${s.name}</td>
       <td class="hx">${hx(s.addr)}</td>
+      <td class="hx" style="color:#8b949e;font-size:10px">${endAddr}</td>
       <td class="sz">${s.size?fz(s.size):'—'}</td>
       <td><span class="tb" style="color:${c};border-color:${c}33;background:${c}11">${s.type}</span></td>
       <td class="dim">${s.section||'—'}</td>

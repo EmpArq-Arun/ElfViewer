@@ -18,6 +18,14 @@ Requires:  pip install bottle
 import os, sys, json, socket, webbrowser, threading, tempfile, shutil
 from pathlib import Path
 
+# ── PyInstaller compatibility ─────────────────────────────────────────────
+# When frozen as .exe, files are in sys._MEIPASS (temp extraction folder).
+# When running as a script, use the directory of this file.
+if getattr(sys, 'frozen', False):
+    BASE_DIR = sys._MEIPASS
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     from bottle import Bottle, request, response, run, static_file, BaseRequest
 except ImportError:
@@ -40,13 +48,18 @@ app = Bottle()
 
 @app.route('/static/<filename:path>')
 def serve_static(filename):
-    return static_file(filename, root=os.path.join(os.path.dirname(__file__), 'static'))
+    resp = static_file(filename, root=os.path.join(BASE_DIR, 'static'))
+    # Prevent browser caching during development
+    resp.set_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+    resp.set_header('Pragma', 'no-cache')
+    resp.set_header('Expires', '0')
+    return resp
 
 # ── Pages ─────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    tmpl = os.path.join(os.path.dirname(__file__), 'templates', 'index.html')
+    tmpl = os.path.join(BASE_DIR, 'templates', 'index.html')
     with open(tmpl, 'r', encoding='utf-8') as f:
         return f.read()
 

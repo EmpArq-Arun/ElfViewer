@@ -163,8 +163,9 @@ function openSymbolPopup(sym){
 
   const overview=`
     <div class="info-grid">
-      <div class="info-card"><div class="info-label">Address</div><div class="info-value hx">${hx(sym.addr)}</div></div>
-      <div class="info-card"><div class="info-label">Size</div><div class="info-value sz">${sym.size?fz(sym.size):'unknown'}</div></div>
+      <div class="info-card"><div class="info-label">Start address</div><div class="info-value hx">${hx(sym.addr)}</div></div>
+      <div class="info-card"><div class="info-label">End address</div><div class="info-value hx">${sym.size?hx(sym.addr+sym.size-1):'—'}</div></div>
+      <div class="info-card"><div class="info-label">Size</div><div class="info-value sz">${sym.size?fz(sym.size)+' ('+sym.size+' bytes)':'unknown'}</div></div>
       <div class="info-card"><div class="info-label">Type</div><div class="info-value">${sym.type} ${sym.global?'(global)':'(local)'}</div></div>
       <div class="info-card"><div class="info-label">Section</div><div class="info-value">${sym.section||'—'}</div></div>
       ${reg?`<div class="info-card"><div class="info-label">Memory region</div><div class="info-value">${reg.name} (${reg.type})</div></div>`:''}
@@ -312,12 +313,3 @@ function openDuplicatePopup(name,syms){
   },50);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// LOOKUP HELPERS — safe alternatives to JSON-in-HTML
-// ═══════════════════════════════════════════════════════════════════════════
-function findSection(name){
-  return S.ld?.sections.find(s=>s.name===name)||null;
-}
-function findSymbol(name,addr){
-  return S.syms.find(s=>s.name===name&&s.addr===addr)||S.syms.find(s=>s.name===name)||null;
-}

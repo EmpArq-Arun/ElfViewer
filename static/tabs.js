@@ -27,6 +27,9 @@ function renderBloat(){
   // Variables table
   if(feat('f_bloatvar'))renderBloatTable('bloat-var',vars.slice(0,50),['name','size','section','file']);
 
+  // Extra symbol analysis (issue 5)
+  renderExtraSymbolAnalysis();
+
   // Duplicates
   if(feat('f_bloatdup')&&S.syms.length){
     const byName={};
@@ -66,20 +69,42 @@ function renderTreemap(containerId,data,sizeKey){
   if(!data.length)return;
   const total=data.reduce((s,r)=>s+r[sizeKey],0);
   if(!total)return;
-  const maxW=container.offsetWidth||600;
   const COLORS=['#3b82f6','#f97316','#10b981','#8b5cf6','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16','#6366f1'];
+  // Use flex-wrap layout — each cell is proportional but min 120px wide
+  // Height scales with importance so large contributors are visually dominant
+  const maxVal=data[0][sizeKey]||1;
   data.slice(0,40).forEach((r,i)=>{
     if(!r[sizeKey])return;
     const pct=r[sizeKey]/total;
-    const w=Math.max(40,pct*maxW*0.9);
-    const h=Math.max(32,Math.min(80,pct*600));
+    const pctOfMax=r[sizeKey]/maxVal;
+    // Width: proportional, min 140px, max 320px
+    const w=Math.min(320,Math.max(140,Math.round(pct*1800)));
+    // Height: taller for bigger contributors
+    const h=Math.min(120,Math.max(64,Math.round(pctOfMax*110+40)));
+    const col=COLORS[i%COLORS.length];
     const cell=document.createElement('div');
     cell.className='tree-cell';
-    cell.style.cssText=`width:${w}px;height:${h}px;background:${COLORS[i%COLORS.length]}22;
-      border:1px solid ${COLORS[i%COLORS.length]}66;`;
-    cell.innerHTML=`<div><div class="tc-name">${r.file}</div><div class="tc-size">${fz(r[sizeKey])}</div></div>`;
+    cell.style.cssText=`width:${w}px;height:${h}px;`
+      +`background:${col}1a;border:1px solid ${col}55;`
+      +`display:flex;flex-direction:column;justify-content:flex-end;padding:8px;`
+      +`cursor:pointer;border-radius:4px;overflow:hidden;position:relative;transition:.15s`;
+    // Percentage bar at bottom
+    cell.innerHTML=`
+      <div style="position:absolute;bottom:0;left:0;right:0;height:${Math.round(pctOfMax*100)}%;`
+        +`background:${col}22;z-index:0"></div>
+      <div style="position:relative;z-index:1">
+        <div style="font-size:10px;font-weight:600;color:#fff;white-space:normal;`
+          +`word-break:break-all;line-height:1.3;margin-bottom:3px">${r.file}</div>
+        <div style="font-size:11px;color:${col};font-weight:700">${fz(r[sizeKey])}</div>
+        <div style="font-size:9px;color:#6e7681">${Math.round(pct*100)}%</div>
+      </div>`;
     cell.addEventListener('click',()=>{$('sym-f').value=r.file;filterSyms();switchTab('sym');});
-    addTip(cell,{name:r.file,rows:[['Flash',fz(r.flash)],['RAM',fz(r.ram)],['Total',fz(r.total)]],desc:'Click to filter symbols by this file'});
+    cell.addEventListener('mouseenter',()=>cell.style.filter='brightness(1.3)');
+    cell.addEventListener('mouseleave',()=>cell.style.filter='');
+    addTip(cell,{name:r.file,rows:[
+      ['Flash',fz(r.flash)],['RAM',fz(r.ram)],['Total',fz(r.total)],
+      ['% of total',Math.round(pct*100)+'%']
+    ],desc:'Click to filter symbols by this file'});
     container.appendChild(cell);
   });
 }
@@ -250,32 +275,391 @@ function filterDead(){
 function sortDead(col){}
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ADDR2LINE
+// ADDRESS INSPECTOR
+// Cross-references an address against ELF symbols, LD sections,
+// map file, and addr2line simultaneously.
 // ═══════════════════════════════════════════════════════════════════════════
-async function doA2L(addr){
-  const a=addr||$('a2l-addr').value.trim();
-  if(!a)return;
-  $('a2l-addr').value=a;
-  $('a2l-res').textContent='Looking up…';
-  if(!S.elfFile){$('a2l-res').textContent='No ELF file loaded';return;}
-  const prefix=$('t-prefix').value.trim();
-  const fd=new FormData();
-  fd.append('addr',a);
-  fd.append('prefix',prefix);
-  fd.append('a2l_tool',$('t-a2l').value.trim());
-  fd.append('elf',S.elfFile);
-  const res=await fetch('/addr2line',{method:'POST',body:fd});
-  const d=await res.json();
-  const result=d.result||d.error||'No result';
-  $('a2l-res').textContent=result;
-  S.a2lHistory.unshift({addr:a,result});
-  if(S.a2lHistory.length>20)S.a2lHistory.pop();
-  const hist=$('a2l-history');hist.innerHTML='';
-  S.a2lHistory.forEach(h=>{
-    const tr=document.createElement('tr');tr.className='clickable';
-    tr.innerHTML=`<td class="hx">${h.addr}</td><td style="font-size:11px;color:var(--dim)">${h.result}</td>`;
-    tr.addEventListener('click',()=>{$('a2l-addr').value=h.addr;$('a2l-res').textContent=h.result;});
-    hist.appendChild(tr);
+
+// Called from drops.js / symbol clicks — sets the input and inspects
+function doA2L(addr) {
+  if (addr) { $('a2l-addr').value = addr; }
+  inspectAddress();
+}
+function setStatus(msg, pct) {
+  const s = document.getElementById('ai-status');
+  if (s) s.textContent = msg || 'Done';
+  const p = $('ai-progress');
+  if (p) p.value = pct;
+}
+
+function onAddrInput(inp) {
+  // Accept bare hex without 0x prefix
+  const v = inp.value.replace(/^0x/i, '').replace(/[^0-9a-fA-F]/g, '');
+  inp.dataset.clean = v;
+}
+
+function clearInspector() {
+  $('a2l-addr').value = '';
+  $('ai-results').style.display = 'none';
+}
+
+function clearHistory() {
+  S.a2lHistory = [];
+  $('ai-history').innerHTML = '';
+}
+
+async function inspectAddress() {
+  const raw = ($('a2l-addr').value || '').trim();
+  if (!raw) return;
+
+  let addrInt;
+  try {
+    addrInt = parseInt(raw.replace(/^0x/i, ''), 16);
+    if (isNaN(addrInt)) throw new Error();
+  } catch(e) {
+    $('ai-results').style.display = '';
+    $('ai-banner').className = 'ai-banner notfound';
+    $('ai-banner').innerHTML = '<span class="ai-addr">' + raw + '</span><span class="ai-sum">Not a valid hex address</span>';
+    return;
+  }
+
+  const hexAddr = '0x' + addrInt.toString(16).toUpperCase().padStart(8, '0');
+  $('a2l-addr').value = hexAddr;
+  $('ai-results').style.display = '';
+  $('ai-progress').style.display = '';
+  $('ai-progress').value = 0;
+  $('ai-banner').className = 'ai-banner';
+  $('ai-banner').innerHTML = '<span class="ai-addr">' + hexAddr + '</span>'
+    + '<span class="ai-sum" id="ai-status">Inspecting…</span>';
+
+  // ── 1. ELF symbol lookup ──────────────────────────────────────────────
+  setStatus('Searching symbols…', 20);
+  const symResult = inspectSymbol(addrInt);
+
+  // ── 2. LD section / region lookup ────────────────────────────────────
+  setStatus('Checking sections…', 45);
+  const secResult = inspectSection(addrInt);
+
+  // ── 3. Map file lookup ────────────────────────────────────────────────
+  setStatus('Searching map file…', 60);
+  const mapResult = inspectMap(addrInt);
+
+  // ── 4. addr2line (async — server call) ───────────────────────────────
+  setStatus('Calling addr2line…', 80);
+  const a2lResult = await inspectA2L(addrInt);
+  setStatus('', 100);
+  $('ai-progress').style.display = 'none';
+
+  // ── Render all four cards ─────────────────────────────────────────────
+  renderSymCard(symResult, addrInt);
+  renderSecCard(secResult);
+  renderMapCard(mapResult);
+  renderA2LCard(a2lResult);
+
+  // ── Summary banner ────────────────────────────────────────────────────
+  renderBanner(hexAddr, symResult, secResult, mapResult, a2lResult);
+
+  // ── Offset bar ────────────────────────────────────────────────────────
+  if (symResult.sym) renderOffsetBar(addrInt, symResult.sym);
+  else $('ai-offset-bar').style.display = 'none';
+
+  // ── History ───────────────────────────────────────────────────────────
+  const entry = {
+    addr:    hexAddr,
+    symName: symResult.sym ? symResult.sym.name : '—',
+    secName: secResult.sec ? secResult.sec.name : '—',
+    source:  a2lResult.short || '—',
+  };
+  S.a2lHistory.unshift(entry);
+  if (S.a2lHistory.length > 30) S.a2lHistory.pop();
+  renderInspectHistory();
+}
+
+// ── Symbol lookup ─────────────────────────────────────────────────────────
+
+function inspectSymbol(addr) {
+  if (!S.syms || !S.syms.length) return { sym: null, reason: 'no_elf' };
+
+  // Find symbol that contains this address (addr >= sym.addr && addr < sym.addr + sym.size)
+  let best = null;
+  for (const sym of S.syms) {
+    if (sym.size > 0 && addr >= sym.addr && addr < sym.addr + sym.size) {
+      // Prefer smaller (more specific) symbol
+      if (!best || sym.size < best.size) best = sym;
+    }
+  }
+
+  // If no ranged match, find nearest symbol below (for zero-size symbols)
+  if (!best) {
+    const below = S.syms.filter(s => s.addr <= addr).sort((a, b) => b.addr - a.addr);
+    if (below.length) {
+      const nearest = below[0];
+      const gap = addr - nearest.addr;
+      return { sym: nearest, offset: gap, exact: false, reason: 'nearest' };
+    }
+    return { sym: null, reason: 'not_found' };
+  }
+
+  return { sym: best, offset: addr - best.addr, exact: true, reason: 'found' };
+}
+
+// ── Section / region lookup ───────────────────────────────────────────────
+
+function inspectSection(addr) {
+  const result = { sec: null, reg: null, elfSec: null };
+  if (!S.ld) return result;
+
+  // Find LD section by cross-referencing ELF section addresses
+  for (const [name, es] of Object.entries(S.elfSecs || {})) {
+    if (es.size > 0 && addr >= es.addr && addr < es.addr + es.size) {
+      result.elfSec = { name, ...es };
+      // Find matching LD section
+      result.sec = S.ld.sections.find(s => s.name === name) || null;
+      break;
+    }
+  }
+
+  // Find memory region
+  for (const reg of (S.ld.regions || [])) {
+    if (reg.length > 0 && addr >= reg.origin && addr < reg.end) {
+      result.reg = reg;
+      break;
+    }
+  }
+
+  return result;
+}
+
+// ── Map file lookup ───────────────────────────────────────────────────────
+
+function inspectMap(addr) {
+  if (!S.mapData) return { unit: null, reason: 'no_map' };
+
+  // Search through all section units for one whose address range contains addr
+  for (const sec of S.mapData.sections) {
+    for (const unit of sec.units) {
+      if (unit.size > 0 && addr >= unit.addr && addr < unit.addr + unit.size) {
+        return { unit, section: sec, reason: 'found' };
+      }
+    }
+  }
+
+  // Nearest unit below addr
+  let best = null, bestDist = Infinity;
+  for (const sec of S.mapData.sections) {
+    for (const unit of sec.units) {
+      if (unit.addr <= addr) {
+        const d = addr - unit.addr;
+        if (d < bestDist) { bestDist = d; best = { unit, section: sec }; }
+      }
+    }
+  }
+  if (best) return { ...best, offset: bestDist, reason: 'nearest' };
+  return { unit: null, reason: 'not_found' };
+}
+
+// ── addr2line ─────────────────────────────────────────────────────────────
+
+async function inspectA2L(addr) {
+  if (!S.elfFile) return { result: null, short: null, reason: 'no_elf' };
+  try {
+    const fd = new FormData();
+    fd.append('addr',     '0x' + addr.toString(16));
+    fd.append('prefix',   $('t-prefix').value.trim());
+    fd.append('a2l_tool', $('t-a2l').value.trim());
+    fd.append('elf',      S.elfFile);
+    const res = await fetch('/addr2line', { method: 'POST', body: fd });
+    const d   = await res.json();
+    const raw = d.result || '';
+    if (!raw || raw.includes('??')) return { result: raw, short: null, reason: 'unknown' };
+    // Extract short form: last path component + line
+    const atIdx = raw.indexOf(' at ');
+    const afterAt = atIdx >= 0 ? raw.slice(atIdx + 4) : raw;
+    const slashIdx = Math.max(afterAt.lastIndexOf('/'), afterAt.lastIndexOf('\\'));
+    const short = slashIdx >= 0 ? afterAt.slice(slashIdx + 1) : afterAt;
+    return { result: raw, short, reason: 'found' };
+  } catch(e) {
+    return { result: null, short: null, reason: 'error', error: e.message };
+  }
+}
+
+// ── Card renderers ────────────────────────────────────────────────────────
+
+function aiRow(key, value, cls) {
+  return `<div class="ai-row"><span class="k">${key}</span><span class="v ${cls||''}">${value}</span></div>`;
+}
+
+function renderSymCard(r, addr) {
+  const body = $('ai-sym-body');
+  if (r.reason === 'no_elf') {
+    body.innerHTML = '<span class="ai-na">Load ELF and click Analyse ELF</span>';
+    return;
+  }
+  if (!r.sym) {
+    body.innerHTML = '<span class="ai-na">No symbol found at this address</span>';
+    return;
+  }
+  const sym = r.sym;
+  const TCOL = { function:'#3b82f6', variable:'#f97316', constant:'#10b981',
+                  weak:'#6366f1', undefined:'#6e7681', other:'#374151' };
+  const col  = TCOL[sym.type] || TCOL.other;
+  const offsetStr = r.offset !== undefined
+    ? `+0x${r.offset.toString(16).toUpperCase()} (${r.offset} bytes in)`
+    : '';
+  const exact = r.reason === 'found';
+
+  body.innerHTML =
+    aiRow('Name',    `<strong style="color:#fff">${sym.name}</strong>`) +
+    aiRow('Type',    `<span style="color:${col}">${sym.type}</span>${sym.global ? '' : ' <span style="color:var(--dim);font-size:10px">(local)</span>'}`) +
+    aiRow('Start',   `0x${sym.addr.toString(16).toUpperCase().padStart(8,'0')}`, 'hx') +
+    (sym.size ? aiRow('Size', fz(sym.size) + ` (${sym.size} bytes)`, 'sz') : '') +
+    (sym.size ? aiRow('End',  `0x${(sym.addr+sym.size-1).toString(16).toUpperCase().padStart(8,'0')} (inclusive)`, 'hx') : '') +
+    (offsetStr ? aiRow(exact ? 'Offset' : 'Nearest offset', offsetStr, exact ? 'sz' : 'warn') : '') +
+    (sym.file ? aiRow('File', sym.file, 'file') : '');
+}
+
+function renderSecCard(r) {
+  const body = $('ai-sec-body');
+  if (!S.ld) {
+    body.innerHTML = '<span class="ai-na">Load a .ld linker script</span>';
+    return;
+  }
+  if (!r.reg && !r.sec) {
+    body.innerHTML = '<span class="ai-na">Address is outside all defined memory regions</span>';
+    return;
+  }
+  let html = '';
+  if (r.reg) {
+    html +=
+      aiRow('Region',   `<strong style="color:#fff">${r.reg.name}</strong>`) +
+      aiRow('Type',     r.reg.type) +
+      aiRow('Range',    `0x${r.reg.origin.toString(16).toUpperCase()} – 0x${r.reg.end.toString(16).toUpperCase()}`, 'hx') +
+      aiRow('Size',     fz(r.reg.length), 'sz');
+  }
+  if (r.elfSec) {
+    html += `<div style="border-top:1px solid var(--bdr);margin:6px 0;padding-top:6px">` +
+      aiRow('Section',  `<strong style="color:#fff">${r.elfSec.name}</strong>`) +
+      aiRow('ELF size', fz(r.elfSec.size), 'sz') +
+      `</div>`;
+  }
+  if (r.sec) {
+    html +=
+      (r.sec.cacheable ? aiRow('Cache', '<span class="v warn">⚠ CACHEABLE — unsafe for DMA</span>') : '') +
+      (r.sec.dma_safe  ? aiRow('DMA',   '<span class="v ok">✓ DMA-safe (non-cacheable)</span>') : '') +
+      (r.sec.noload    ? aiRow('NOLOAD','Not in flash image — zeroed/filled at startup') : '') +
+      (r.sec.lma       ? aiRow('LMA',   'Copied from ' + r.sec.lma + ' at startup', 'file') : '');
+  }
+  body.innerHTML = html || '<span class="ai-na">No section info available</span>';
+}
+
+function renderMapCard(r) {
+  const body = $('ai-map-body');
+  if (r.reason === 'no_map') {
+    body.innerHTML = '<span class="ai-na">Load a .map file</span>';
+    return;
+  }
+  if (!r.unit) {
+    body.innerHTML = '<span class="ai-na">Address not found in map file</span>';
+    return;
+  }
+  const inRange = r.reason === 'found';
+  body.innerHTML =
+    aiRow('File',       `<strong style="color:#fff">${r.unit.file}</strong>`) +
+    (r.unit.file_full !== r.unit.file ? aiRow('Full path', r.unit.file_full, 'file') : '') +
+    aiRow('Subsection', r.unit.subsection) +
+    aiRow('Unit start', `0x${r.unit.addr.toString(16).toUpperCase().padStart(8,'0')}`, 'hx') +
+    aiRow('Unit size',  fz(r.unit.size), 'sz') +
+    aiRow('In section', r.section.name) +
+    (!inRange ? aiRow('Note', `+0x${r.offset.toString(16)} after unit start (nearest match)`, 'warn') : '');
+}
+
+function renderA2LCard(r) {
+  const body = $('ai-a2l-body');
+  if (r.reason === 'no_elf') {
+    body.innerHTML = '<span class="ai-na">Load ELF and click Analyse ELF</span>';
+    return;
+  }
+  if (!r.result || r.reason === 'error') {
+    body.innerHTML = '<span class="ai-na">' + (r.error || 'addr2line not available') + '</span>';
+    return;
+  }
+  if (r.reason === 'unknown') {
+    body.innerHTML = '<span class="ai-na">Symbol not found (may be stripped or inline)</span>';
+    return;
+  }
+  // Parse the addr2line output:  "funcname() at file.c:123"
+  const parts  = r.result.match(/^(.*?) at (.+):(\d+)$/);
+  if (parts) {
+    body.innerHTML =
+      aiRow('Function', `<strong style="color:#fff">${parts[1]}</strong>`) +
+      aiRow('File',     parts[2], 'src') +
+      aiRow('Line',     `<strong style="color:var(--acc)">${parts[3]}</strong>`);
+  } else {
+    body.innerHTML = `<div style="font-size:11px;color:var(--pur);word-break:break-all">${r.result}</div>`;
+  }
+}
+
+function renderBanner(hexAddr, symR, secR, mapR, a2lR) {
+  const banner = $('ai-banner');
+  const hasAny = symR.sym || secR.reg || mapR.unit;
+  banner.className = 'ai-banner ' + (hasAny ? 'found' : 'notfound');
+
+  let parts = [`<span class="ai-addr">${hexAddr}</span>`];
+  if (symR.sym) {
+    const exact = symR.reason === 'found';
+    const TCOL = { function:'#3b82f6', variable:'#f97316', constant:'#10b981',
+                    weak:'#6366f1', other:'#374151' };
+    const col = TCOL[symR.sym.type] || TCOL.other;
+    parts.push(`<span class="ai-sum">→ <span class="ai-sym-name">${symR.sym.name}</span>` +
+      (exact && symR.offset ? ` <span style="color:var(--dim)">+0x${symR.offset.toString(16)}</span>` : '') +
+      ` <span style="color:${col};font-size:11px">${symR.sym.type}</span></span>`);
+  }
+  if (secR.reg) {
+    parts.push(`<span style="color:var(--dim);font-size:11px">in ${secR.reg.name}` +
+      (secR.elfSec ? ` / ${secR.elfSec.name}` : '') + `</span>`);
+  }
+  if (secR.sec && secR.sec.cacheable) {
+    parts.push('<span style="color:var(--ora);font-size:11px">⚠ cacheable</span>');
+  }
+  if (mapR.unit) {
+    parts.push(`<span style="color:var(--ora);font-size:11px">📂 ${mapR.unit.file}</span>`);
+  }
+  if (!hasAny) {
+    parts.push('<span class="ai-sum">Address not found in any loaded data source</span>');
+  }
+  banner.innerHTML = parts.join(' ');
+}
+
+function renderOffsetBar(addr, sym) {
+  if (!sym.size) { $('ai-offset-bar').style.display = 'none'; return; }
+  $('ai-offset-bar').style.display = '';
+  const pct    = Math.min(1, (addr - sym.addr) / sym.size);
+  const pctPx  = Math.round(pct * 100);
+  $('ai-offset-fill').style.width   = pctPx + '%';
+  $('ai-offset-marker').style.left  = pctPx + '%';
+  const offset = addr - sym.addr;
+  $('ai-offset-labels').innerHTML =
+    `<span>0x${sym.addr.toString(16).toUpperCase()} (start)</span>` +
+    `<span style="color:var(--acc)">+0x${offset.toString(16)} = ${Math.round(pct*100)}%</span>` +
+    `<span>0x${(sym.addr+sym.size).toString(16).toUpperCase()} (end)</span>`;
+}
+
+function renderInspectHistory() {
+  const tbody = $('ai-history');
+  tbody.innerHTML = '';
+  S.a2lHistory.forEach(h => {
+    const tr = document.createElement('tr');
+    tr.className = 'clickable';
+    tr.innerHTML =
+      `<td class="hx">${h.addr}</td>` +
+      `<td style="color:#fff;font-size:11px">${h.symName}</td>` +
+      `<td class="dim" style="font-size:11px">${h.secName}</td>` +
+      `<td class="dim" style="font-size:11px">${h.source}</td>`;
+    tr.addEventListener('click', () => {
+      $('a2l-addr').value = h.addr;
+      inspectAddress();
+    });
+    tbody.appendChild(tr);
   });
 }
 
@@ -313,4 +697,243 @@ async function runDebug(){
     out+='\n';
   }
   $('dbg-out').textContent=out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUE 5 — EXTRA SYMBOL ANALYSIS
+// Additional symbol intelligence beyond duplicate detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+function renderExtraSymbolAnalysis() {
+  if (!S.syms.length) return;
+
+  // ── Weak symbols with no strong override ──────────────────────────────
+  const weakSyms = S.syms.filter(s => s.type === 'weak' || s.type === 'weak_obj');
+  const strongNames = new Set(S.syms.filter(s => s.type === 'function' || s.type === 'variable').map(s => s.name));
+  const unresolved = weakSyms.filter(s => !strongNames.has(s.name));
+
+  // ── printf/malloc/heap usage ───────────────────────────────────────────
+  const heapSigns = ['malloc','free','calloc','realloc','_malloc_r','_sbrk',
+                     'printf','fprintf','sprintf','snprintf','puts','scanf'];
+  const heapSyms = S.syms.filter(s => heapSigns.includes(s.name));
+
+  // ── Interrupt handlers (ISR detection) ───────────────────────────────
+  const isrPatterns = [/^[A-Z][A-Za-z0-9_]+_IRQHandler$/, /^[A-Z][A-Za-z0-9_]+_Handler$/,
+                       /^SysTick/, /^HardFault/, /^NMI_/, /^PendSV/];
+  const isrSyms = S.syms.filter(s => s.type === 'function'
+    && isrPatterns.some(p => p.test(s.name)));
+
+  // ── Section size contribution per file (from map) ─────────────────────
+  // (already in map file tab — cross-reference here)
+
+  // Expose via bloat content area as extra cards
+  const bloatContent = $('bloat-content');
+  if (!bloatContent) return;
+
+  // Remove old extra cards
+  document.querySelectorAll('.extra-sym-card').forEach(e => e.remove());
+
+  const makeCard = (title, subtitle, rows, clickCb) => {
+    const card = document.createElement('div');
+    card.className = 'card-wrap extra-sym-card';
+    let rowsHtml = rows.slice(0,20).map(r =>
+      `<tr class="clickable" data-sym-name="${r.name}" data-sym-addr="${r.addr}">
+        <td style="color:var(--acc);font-size:11px">${r.name}</td>
+        <td class="hx">${hx(r.addr)}</td>
+        <td class="sz">${r.size ? fz(r.size) : '—'}</td>
+        <td class="dim" style="font-size:10px">${r.file||r.section||'—'}</td>
+       </tr>`).join('');
+    card.innerHTML = `<div class="tbl-hdr">${title}<span class="sub">${subtitle}</span></div>
+      <table><thead><tr><th>Name</th><th>Address</th><th>Size</th><th>File/Section</th></tr></thead>
+      <tbody>${rowsHtml||'<tr><td colspan="4" style="color:var(--dim);padding:10px">None found</td></tr>'}</tbody></table>`;
+    card.querySelectorAll('tr[data-sym-name]').forEach(tr => {
+      tr.addEventListener('click', () => {
+        const sym = findSymbol(tr.dataset.symName, parseInt(tr.dataset.symAddr));
+        if (sym) openSymbolPopup(sym);
+      });
+    });
+    return card;
+  };
+
+  if (unresolved.length) {
+    bloatContent.appendChild(makeCard(
+      '⚠ Weak symbols with no strong definition',
+      'these use the weak fallback — may be intentional or a missing implementation',
+      unresolved
+    ));
+  }
+
+  if (heapSyms.length) {
+    bloatContent.appendChild(makeCard(
+      '🧱 Dynamic memory / printf family',
+      'linked symbols that indicate heap or formatted I/O usage',
+      heapSyms
+    ));
+  }
+
+  if (isrSyms.length) {
+    bloatContent.appendChild(makeCard(
+      '⚡ Interrupt handlers',
+      'ISR functions — candidates for ITCM placement for fast response',
+      isrSyms.sort((a,b) => b.size - a.size)
+    ));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ISSUE 6 — STACK DEPTH (.su file parsing)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SU_DATA = { entries: [], filtered: [], sortCol: 'size', sortDir: -1 };
+
+// Wire the su drop zone (called from utils.js init)
+function initStackDrop() {
+  const div = document.getElementById('su-drop');
+  const inp = document.getElementById('su-fi');
+  if (!div || !inp) return;
+
+  div.addEventListener('dragover',  e => { e.preventDefault(); div.classList.add('over'); });
+  div.addEventListener('dragleave', () => div.classList.remove('over'));
+  div.addEventListener('drop', e => {
+    e.preventDefault(); div.classList.remove('over');
+    loadSUFiles(Array.from(e.dataTransfer.files));
+  });
+  div.addEventListener('click', e => { if (e.target !== inp) inp.click(); });
+  inp.addEventListener('change', e => {
+    loadSUFiles(Array.from(e.target.files));
+    inp.value = '';
+  });
+}
+
+function loadSUFiles(files) {
+  const suFiles = files.filter(f => f.name.endsWith('.su'));
+  if (!suFiles.length) { alert('Drop .su files (generated by GCC -fstack-usage)'); return; }
+
+  let loaded = 0;
+  suFiles.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      parseSUFile(file.name, e.target.result);
+      loaded++;
+      if (loaded === suFiles.length) renderStackDepth();
+    };
+    reader.readAsText(file);
+  });
+}
+
+function parseSUFile(filename, content) {
+  // GCC .su format: "path/file.c:line:col:function\tbytes\ttype"
+  // type is: static | dynamic | dynamic,bounded
+  const slashPos = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
+  const shortName = slashPos >= 0 ? filename.slice(slashPos + 1) : filename;
+  for (const line of content.splitlines ? content.splitlines() : content.split('\n')) {
+    const m = line.match(/^([^:]+):(\d+):\d+:(\S+)\s+(\d+)\s+(\S+)/);
+    if (!m) continue;
+    const existing = SU_DATA.entries.find(e => e.func === m[3] && e.file === shortName);
+    if (!existing) {
+      SU_DATA.entries.push({
+        file:   shortName,
+        line:   parseInt(m[2]),
+        func:   m[3],
+        size:   parseInt(m[4]),
+        type:   m[5].replace(',', ' '),   // "dynamic,bounded" → "dynamic bounded"
+      });
+    }
+  }
+}
+
+function renderStackDepth() {
+  if (!SU_DATA.entries.length) return;
+  $('stack-no-data').style.display = 'none';
+  $('stack-content').style.display = '';
+
+  const entries = SU_DATA.entries;
+  const maxSize = Math.max(...entries.map(e => e.size), 1);
+  const totalFuncs = entries.length;
+  const unbounded = entries.filter(e => e.type.includes('dynamic') && !e.type.includes('bounded'));
+  const worstCase = entries.filter(e => e.type === 'static').reduce((m, e) => Math.max(m, e.size), 0);
+
+  $('stack-stats').innerHTML = `
+    <div class="stat"><div class="snum">${totalFuncs}</div><div class="slbl">Functions analysed</div></div>
+    <div class="stat"><div class="snum" style="color:var(--grn)">${worstCase}</div><div class="slbl">Largest static frame (bytes)</div></div>
+    <div class="stat"><div class="snum" style="color:${unbounded.length?'var(--red)':'var(--grn)'}">${unbounded.length}</div>
+      <div class="slbl">Unbounded dynamic frames<br>${unbounded.length?'⚠ investigate these':'✓ none found'}</div></div>
+    <div class="stat"><div class="snum" style="color:var(--dim)">${entries.filter(e=>e.type.includes('dynamic')&&e.type.includes('bounded')).length}</div>
+      <div class="slbl">Bounded dynamic frames</div></div>`;
+
+  // Unbounded card
+  const ubCard = $('stack-unbounded-card');
+  ubCard.style.display = unbounded.length ? '' : 'none';
+  const ubBody = $('stack-unbounded');
+  ubBody.innerHTML = '';
+  unbounded.forEach(e => {
+    const tr = document.createElement('tr');
+    tr.className = 'stack-unbounded-row clickable';
+    tr.innerHTML = `<td style="font-size:11px">${e.func}</td><td class="dim" style="font-size:11px">${e.file}:${e.line}</td>`;
+    ubBody.appendChild(tr);
+  });
+
+  filterStack();
+}
+
+function filterStack() {
+  const q   = ($('stack-q')?.value || '').toLowerCase();
+  const typ = $('stack-type')?.value || '';
+  SU_DATA.filtered = SU_DATA.entries.filter(e => {
+    if (q   && !e.func.toLowerCase().includes(q) && !e.file.toLowerCase().includes(q)) return false;
+    if (typ && !e.type.includes(typ)) return false;
+    return true;
+  });
+  sortAndRenderStack();
+}
+
+function sortStack(col) {
+  if (SU_DATA.sortCol === col) SU_DATA.sortDir *= -1;
+  else { SU_DATA.sortCol = col; SU_DATA.sortDir = -1; }
+  sortAndRenderStack();
+}
+
+function sortAndRenderStack() {
+  const { sortCol: col, sortDir: dir } = SU_DATA;
+  const sorted = [...SU_DATA.filtered].sort((a, b) => {
+    const va = col === 'size' ? a.size : (a[col] || '');
+    const vb = col === 'size' ? b.size : (b[col] || '');
+    return (typeof va === 'number' ? va - vb : va.toString().localeCompare(vb.toString())) * dir;
+  });
+
+  $('stack-cnt').textContent = `${sorted.length} / ${SU_DATA.entries.length}`;
+  const tbody = $('stack-tbody'); tbody.innerHTML = '';
+  const maxSize = Math.max(...SU_DATA.entries.map(e => e.size), 1);
+
+  sorted.slice(0, 500).forEach(e => {
+    const typeClass = e.type.includes('unbounded') || (e.type.includes('dynamic') && !e.type.includes('bounded'))
+      ? 'stack-dynamic' : e.type.includes('bounded') ? 'stack-bounded' : 'stack-static';
+    const barW = Math.round(e.size / maxSize * 80);
+    const tr = document.createElement('tr'); tr.className = 'clickable';
+    tr.innerHTML = `
+      <td style="font-size:11px;color:#fff">${e.func}</td>
+      <td>
+        <span class="sz" style="margin-right:6px">${e.size}</span>
+        <div class="fill-bg" style="width:80px;display:inline-block">
+          <div class="fill-bar" style="width:${barW}px;background:${
+            e.size > 1024 ? 'var(--red)' : e.size > 256 ? 'var(--ora)' : 'var(--grn)'}"></div>
+        </div>
+      </td>
+      <td><span class="stack-type-badge ${typeClass}">${e.type}</span></td>
+      <td class="dim" style="font-size:10px">${e.file}:${e.line}</td>`;
+    // Click to jump to address inspector with symbol name lookup
+    tr.addEventListener('click', () => {
+      const sym = S.syms.find(s => s.name === e.func || s.name.endsWith(e.func));
+      if (sym) openSymbolPopup(sym);
+    });
+    tbody.appendChild(tr);
+  });
+}
+
+function exportStackCSV() {
+  const lines = ['Function,Stack bytes,Type,File,Line'];
+  SU_DATA.filtered.forEach(e => lines.push(`"${e.func}","${e.size}","${e.type}","${e.file}","${e.line}"`));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type:'text/csv'}));
+  a.download = 'stack_usage.csv'; a.click();
 }

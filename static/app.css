@@ -311,3 +311,129 @@ select.fsel:focus{outline:none;border-color:var(--acc)}
 .xref-ref{font-size:11px;color:var(--dim)}
 footer{text-align:center;padding:10px;color:var(--dim);font-size:11px;flex-shrink:0;
   border-top:1px solid var(--bdr);background:var(--surf)}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ADDRESS INSPECTOR
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.addr-inspector{ display:flex; flex-direction:column; gap:12px; }
+
+/* Input row */
+.ai-input-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ai-input-wrap{display:flex;align-items:center;background:var(--surf);
+  border:1px solid var(--bdr);border-radius:var(--rad2);overflow:hidden;
+  flex:1;min-width:200px;transition:.15s}
+.ai-input-wrap:focus-within{border-color:var(--acc)}
+.ai-prefix{padding:0 8px;color:var(--dim);font:13px var(--mono);
+  border-right:1px solid var(--bdr);background:var(--s2);
+  height:100%;display:flex;align-items:center;user-select:none}
+.ai-input{background:transparent;border:none;outline:none;color:var(--txt);
+  font:14px var(--mono);padding:8px 10px;flex:1;letter-spacing:.05em}
+.ai-hint{font-size:11px;color:var(--dim);line-height:1.5}
+
+/* Summary banner */
+.ai-banner{background:var(--s2);border:1px solid var(--bdr);border-radius:var(--rad);
+  padding:12px 16px;font-size:12px;display:flex;align-items:center;gap:10px;
+  flex-wrap:wrap;line-height:1.6}
+.ai-banner.found{border-color:#1a5c2a;background:#0d2318}
+.ai-banner.notfound{border-color:#5a3d1a;background:#100c05}
+.ai-banner .ai-addr{font-size:15px;font-weight:700;color:var(--acc);
+  font-family:var(--mono);flex-shrink:0}
+.ai-banner .ai-sum{color:var(--dim)}
+.ai-banner .ai-sym-name{color:#fff;font-weight:600}
+
+/* Four-card grid */
+.ai-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
+.ai-card{background:var(--surf);border:1px solid var(--bdr);border-radius:var(--rad);
+  overflow:hidden;transition:.15s}
+.ai-card:hover{border-color:var(--bdr2)}
+.ai-card-hdr{background:var(--s2);padding:8px 12px;display:flex;
+  align-items:center;gap:7px;border-bottom:1px solid var(--bdr)}
+.ai-card-icon{font-size:14px}
+.ai-card-title{font-size:11px;font-weight:600;color:#fff;font-family:var(--ui)}
+.ai-src-badge{font-size:9px;padding:1px 5px;border-radius:3px;font-weight:600;
+  margin-left:4px;vertical-align:middle}
+.ai-src-badge.ld {background:#0d2140;color:var(--acc);border:1px solid #1a3a6a}
+.ai-src-badge.elf{background:#1e0d33;color:var(--pur);border:1px solid #3a1a6a}
+.ai-src-badge.map{background:#1e1008;color:var(--ora);border:1px solid #5a3010}
+.ai-card-body{padding:12px;display:flex;flex-direction:column;gap:6px;min-height:80px}
+.ai-na{color:var(--dim);font-size:11px;font-style:italic}
+.ai-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;
+  font-size:12px;border-bottom:1px solid #0a0e14;padding-bottom:5px}
+.ai-row:last-child{border:none;padding:0}
+.ai-row .k{color:var(--dim);flex-shrink:0;font-size:11px}
+.ai-row .v{color:#fff;text-align:right;word-break:break-all}
+.ai-row .v.hx{color:var(--acc)}
+.ai-row .v.sz{color:var(--grn)}
+.ai-row .v.warn{color:var(--ora)}
+.ai-row .v.ok{color:var(--grn)}
+.ai-row .v.src{color:var(--pur);font-size:11px}
+.ai-row .v.file{color:var(--ora);font-size:11px}
+
+/* Offset bar — shows where in symbol the address falls */
+.ai-offset-bar{background:var(--surf);border:1px solid var(--bdr);
+  border-radius:var(--rad);padding:14px 16px}
+.ai-offset-track{position:relative;height:20px;background:var(--s3);
+  border-radius:4px;overflow:visible;margin-bottom:6px}
+.ai-offset-fill{position:absolute;left:0;top:0;height:100%;
+  background:linear-gradient(90deg,#3b82f644,#3b82f6aa);
+  border-radius:4px;transition:width .4s}
+.ai-offset-marker{position:absolute;top:-4px;width:3px;height:28px;
+  background:var(--acc);border-radius:2px;transition:left .4s;
+  box-shadow:0 0 6px var(--acc)}
+.ai-offset-labels{display:flex;justify-content:space-between;
+  font-size:10px;color:var(--dim)}
+.ai-offset-offset{position:absolute;top:-20px;transform:translateX(-50%);
+  font-size:10px;color:var(--acc);white-space:nowrap;font-weight:600}
+
+/* History table row */
+#ai-history tr.clickable:hover td{background:#0a0f18;cursor:pointer}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ISSUE 3 — VISIBILITY FIXES
+   Dim text is too dark; secondary info should be subtle but still legible.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Secondary text: was #6e7681 (~28% brightness) → #8b949e (~56%) */
+.dim            { color: #8b949e !important; }
+.ai-na          { color: #8b949e; }
+.feat-desc      { color: #8b949e; }
+.sc-desc        { color: #8b949e; }
+
+/* Region table dim type column */
+td.dim          { color: #8b949e !important; }
+
+/* Table header labels */
+th              { color: #8b949e; }
+
+/* Chip default */
+.chip           { color: #8b949e; }
+
+/* Section card type label */
+.sc-type        { color: #8b949e; }
+
+/* Info card label */
+.info-label     { color: #8b949e; }
+
+/* Sidebar labels */
+.tool-row label { color: #8b949e; }
+.sb-title       { color: #8b949e; }
+
+/* Tooltip dim rows */
+.tr2 span:first-child { color: #8b949e; }
+
+/* Progress bar styling */
+progress::-webkit-progress-value { background: var(--acc); border-radius: 2px; }
+progress::-moz-progress-bar      { background: var(--acc); border-radius: 2px; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   STACK DEPTH PANE
+   ═══════════════════════════════════════════════════════════════════════════ */
+.stack-type-badge {
+  display:inline-block;padding:1px 7px;border-radius:3px;
+  font-size:10px;font-weight:600;border:1px solid;
+}
+.stack-static  { color:var(--grn);border-color:#1a5c2a;background:#0d2318; }
+.stack-dynamic { color:var(--ora);border-color:#5a3d1a;background:#100c05; }
+.stack-bounded { color:var(--acc);border-color:#1a3a6a;background:#0d1e33; }
+.stack-unbounded-row td { color:var(--red) !important; }
