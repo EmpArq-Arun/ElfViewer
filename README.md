@@ -41,11 +41,14 @@ python app.py 8080
 
 Drop any combination of files — each is optional:
 
-| File | What it unlocks |
-|------|----------------|
-| `.ld` | Memory map, regions, sections, startup cost |
-| `.elf` / `.axf` | Symbols, sizes, DMA warnings, addr→line |
-| `.map` | Per-.o flash/RAM breakdown, GC'd sections |
+| File            | What it unlocks                              |
+|-----------------|----------------------------------------------|
+| `.ld`           | Memory map, regions, sections, startup cost  |
+| `.elf` / `.axf` | Symbols, sizes, DMA warnings, addr→line      |
+| `.map`          | Per-.o flash/RAM breakdown, GC'd sections    |
+| `.su`           | Per-.su Stack depth information              |
+| `.ci`           | Per-.ci Stack chain addition                 |
+
 
 ## Toolchain
 
@@ -93,3 +96,11 @@ are `display:none` siblings of the drop area divs (not overlaid inside
 them). The div's `click` handler calls `input.click()` explicitly.
 All wiring runs in `DOMContentLoaded` so the DOM is guaranteed ready.
 No data is ever placed inside HTML attribute strings.
+
+## Embedded code compiler flags that would make stack depth work
+
+| Flag                   | Purpose                                                                         |
+|------------------------|---------------------------------------------------------------------------------|
+| -fstack-usage          | Emits per-function stack frame sizes in .su files gcc.gnu+1                     |
+| -fcallgraph-info=su,da | Produces call-graph information with stack-cost data per edge github+1          |
+| -Wstack-usage=256      | Warns at compile time when a function’s stack usage exceeds 256 bytes gcc.gnu+1 |

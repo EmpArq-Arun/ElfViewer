@@ -780,329 +780,823 @@ function renderExtraSymbolAnalysis() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ISSUE 6 — STACK DEPTH (.su file parsing)
-// ═══════════════════════════════════════════════════════════════════════════
+// =============================================================================
+// STACK DEPTH ANALYSIS
+// =============================================================================
+//
+// This tab supports two levels of analysis depending on which GCC flags
+// were used during the build:
+//
+//   Level 1 — .su only (needs -fstack-usage)
+//     • Per-function stack frame size
+//     • Static / dynamic / dynamic-bounded classification
+//     • Sorted list with bar chart
+//     • Unbounded frame warning
+//
+//   Level 2 — .su + .ci (needs -fstack-usage AND -fcallgraph-info=su,da)
+//     • Everything from Level 1 PLUS:
+//     • Worst-case stack depth across the full call chain
+//     • "IpcMaster_Task calls BswSpi_Exchange calls LPSPI_DRV_MasterTransfer"
+//     • Recursive function detection
+//     • Top-N deepest call chains with path visualisation
+//
+// HOW TO ENABLE (S32DS / arm-none-eabi-gcc):
+//   Project → Properties → C/C++ Build → Settings →
+//   Compiler → Miscellaneous → Other flags, add:
+//     -fstack-usage -fcallgraph-info=su,da -Wstack-usage=256
+//
+//   Then use the scan feature to point at the Debug/ or Release/ build folder.
+//   The tool finds all .su and .ci files automatically across all subfolders.
+//
+// WHY WORST-CASE MATTERS (embedded engineer note):
+//   Each FreeRTOS task needs a stack large enough for its deepest call chain.
+//   .su alone gives "IpcMaster_Task frame = 64 bytes".
+//   .ci tells you "IpcMaster_Task → BswSpi_Exchange → LPSPI_DRV_MasterTransfer
+//   total = 64 + 8 + 32 + 4 + 128 = 236 bytes".
+//   Without this, you're guessing task stack sizes — common cause of stack overflow.
+// =============================================================================
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STACK DEPTH — .su file management
-// ═══════════════════════════════════════════════════════════════════════════
+// ── Shared state ─────────────────────────────────────────────────────────────
 
 const SU_DATA = {
-  entries:   [],       // all parsed entries across all loaded files
-  filtered:  [],
-  loadedFiles: [],     // {name, count} — files successfully loaded
-  scanResults: [],     // [{path, name, selected}] — from server scan
-  sortCol: 'size', sortDir: -1
+    entries:      [],   // {func, file, line, size, type}  — from .su files
+    loadedFiles:  [],   // {name, count}                   — files loaded so far
+    scanResults:  null, // full scan response from /scan_su
+    ciContents:   [],   // {name, content}                 — raw .ci file text
+    cgResult:     null, // result from /analyse_callgraph
+    filtered:     [],
+    sortCol: 'worst_case', sortDir: -1,  // default sort: worst-case depth
 };
 
-// ── Initialise drop zone (called from DOMContentLoaded) ───────────────────
+// ── Drop zone wiring ──────────────────────────────────────────────────────────
+
+/**
+ * Called from DOMContentLoaded in index.html.
+ * Wires up the .su / .ci file drop zone and click-to-browse.
+ * Inputs are display:none siblings — no CSS overlay tricks needed.
+ */
 function initStackDrop() {
-  const div = document.getElementById('su-drop');
-  const inp = document.getElementById('su-fi');
-  if (!div || !inp) return;
+    const div = document.getElementById('su-drop');
+    const inp = document.getElementById('su-fi');
+    if (!div || !inp) { console.warn('[stack] su-drop or su-fi not found'); return; }
 
-  div.addEventListener('dragover',  e => { e.preventDefault(); div.classList.add('over'); });
-  div.addEventListener('dragleave', () => div.classList.remove('over'));
-  div.addEventListener('drop', e => {
-    e.preventDefault(); div.classList.remove('over');
-    loadSUFiles(Array.from(e.dataTransfer.files));
-  });
-  div.addEventListener('click', e => { if (e.target !== inp) inp.click(); });
-  inp.addEventListener('change', e => {
-    loadSUFiles(Array.from(e.target.files));
-    inp.value = '';   // reset so same file can be re-added
-  });
+    div.addEventListener('dragover',  e => { e.preventDefault(); div.classList.add('over'); });
+    div.addEventListener('dragleave', ()  => div.classList.remove('over'));
+    div.addEventListener('drop', e => {
+        e.preventDefault(); div.classList.remove('over');
+        loadSUFiles(Array.from(e.dataTransfer.files));
+    });
+    // Click anywhere on the div opens the file picker
+    div.addEventListener('click', e => { if (e.target !== inp) inp.click(); });
+    inp.addEventListener('change', e => {
+        loadSUFiles(Array.from(e.target.files));
+        inp.value = '';   // allow re-selecting the same file
+    });
 }
 
-// ── Load files from browser drop / picker ────────────────────────────────
+// ── File loading (drag-and-drop or file picker) ───────────────────────────────
+
+/**
+ * Process files dropped or selected by the user.
+ * Accepts any mix of .su and .ci files in one drop.
+ * Calling this again adds to existing data (does not replace it).
+ */
 function loadSUFiles(files) {
-  const suFiles = files.filter(f => f.name.endsWith('.su'));
-  if (!suFiles.length) {
-    document.getElementById('su-scan-status').textContent =
-      'No .su files found — make sure GCC -fstack-usage flag is enabled';
-    return;
-  }
+    const suFiles = files.filter(f => f.name.endsWith('.su'));
+    const ciFiles = files.filter(f => f.name.endsWith('.ci'));
 
-  let loaded = 0;
-  suFiles.forEach(file => {
-    const reader = new FileReader();
-    reader.onload = e => {
-      const count = parseSUFile(file.name, e.target.result);
-      // Track which files are loaded
-      const existing = SU_DATA.loadedFiles.find(f => f.name === file.name);
-      if (existing) existing.count = count;
-      else SU_DATA.loadedFiles.push({ name: file.name, count });
-      loaded++;
-      if (loaded === suFiles.length) {
-        updateSUDropLabel();
-        renderStackDepth();
-      }
-    };
-    reader.readAsText(file);
-  });
-}
-
-// ── Path scan — server-side directory walk ───────────────────────────────
-async function scanSUPath() {
-  const pathInput = document.getElementById('su-path');
-  const status    = document.getElementById('su-scan-status');
-  const path = pathInput.value.trim();
-  if (!path) { status.textContent = 'Enter a directory path first'; return; }
-
-  status.textContent = 'Scanning…';
-  document.getElementById('su-picker').style.display = 'none';
-
-  try {
-    const fd = new FormData();
-    fd.append('path', path);
-    const res = await fetch('/scan_su', { method: 'POST', body: fd });
-    const d   = await res.json();
-
-    if (d.error) { status.textContent = 'Error: ' + d.error; return; }
-    if (!d.files || !d.files.length) {
-      status.textContent = 'No .su files found in that directory. Check the path and rebuild with -fstack-usage.';
-      return;
+    if (!suFiles.length && !ciFiles.length) {
+        suScanStatus('No .su or .ci files found. Drop files from your GCC build output directory.');
+        return;
     }
 
-    SU_DATA.scanResults = d.files.map(f => ({ ...f, selected: true }));
-    status.textContent = '';
-    renderSUPicker(d.files.length);
+    const total = suFiles.length + ciFiles.length;
+    let done = 0;
 
-  } catch(e) {
-    status.textContent = 'Scan failed: ' + e.message;
-  }
-}
+    const onAllLoaded = () => {
+        done++;
+        if (done === total) {
+            updateSUDropLabel();
+            if (SU_DATA.ciContents.length) {
+                runCallgraphAnalysis();   // .ci present → compute worst-case chains
+            } else {
+                renderStackDepth();       // .su only → render frame sizes
+            }
+        }
+    };
 
-function renderSUPicker(total) {
-  const picker = document.getElementById('su-picker');
-  const list   = document.getElementById('su-picker-list');
-  const title  = document.getElementById('su-picker-title');
-
-  title.textContent = total + ' .su file' + (total !== 1 ? 's' : '') + ' found';
-  list.innerHTML = '';
-
-  SU_DATA.scanResults.forEach((f, i) => {
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:4px;cursor:pointer';
-    row.innerHTML =
-      '<input type="checkbox" ' + (f.selected ? 'checked' : '') + ' style="accent-color:var(--acc);flex-shrink:0">' +
-      '<span style="font-size:11px;color:#8b949e;flex-shrink:0;width:160px;overflow:hidden;text-overflow:ellipsis" title="' + f.path + '">' + f.name + '</span>' +
-      '<span style="font-size:10px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + f.path + '">' + f.dir + '</span>';
-    const cb = row.querySelector('input');
-    cb.addEventListener('change', () => { SU_DATA.scanResults[i].selected = cb.checked; });
-    row.addEventListener('click', e => { if (e.target !== cb) { cb.checked = !cb.checked; SU_DATA.scanResults[i].selected = cb.checked; }});
-    list.appendChild(row);
-  });
-
-  picker.style.display = '';
-}
-
-function suPickerSelectAll()  { SU_DATA.scanResults.forEach(f => f.selected = true);  renderSUPicker(SU_DATA.scanResults.length); }
-function suPickerSelectNone() { SU_DATA.scanResults.forEach(f => f.selected = false); renderSUPicker(SU_DATA.scanResults.length); }
-
-async function loadSelectedSU() {
-  const selected = SU_DATA.scanResults.filter(f => f.selected);
-  if (!selected.length) { alert('Select at least one file'); return; }
-
-  const btn = document.querySelector('[onclick="loadSelectedSU()"]');
-  btn.textContent = 'Loading…'; btn.disabled = true;
-
-  try {
-    const fd = new FormData();
-    fd.append('paths', JSON.stringify(selected.map(f => f.path)));
-    const res = await fetch('/load_su_files', { method: 'POST', body: fd });
-    const d   = await res.json();
-
-    if (d.error) { alert('Load error: ' + d.error); return; }
-
-    // Parse each returned file content
-    d.files.forEach(f => {
-      const count = parseSUFile(f.name, f.content);
-      const existing = SU_DATA.loadedFiles.find(x => x.name === f.name);
-      if (existing) existing.count = count;
-      else SU_DATA.loadedFiles.push({ name: f.name, count });
+    suFiles.forEach(file => {
+        readText(file, text => {
+            const count = parseSUFile(file.name, text);
+            upsertLoadedFile(file.name, count);
+            onAllLoaded();
+        });
     });
 
+    ciFiles.forEach(file => {
+        readText(file, text => {
+            // Upsert: replace if same file re-dropped
+            const idx = SU_DATA.ciContents.findIndex(c => c.name === file.name);
+            if (idx >= 0) SU_DATA.ciContents[idx] = { name: file.name, content: text };
+            else          SU_DATA.ciContents.push(  { name: file.name, content: text });
+            onAllLoaded();
+        });
+    });
+}
+
+function readText(file, cb) {
+    const r = new FileReader();
+    r.onload  = e => cb(e.target.result);
+    r.onerror = () => suScanStatus('Failed to read ' + file.name);
+    r.readAsText(file);
+}
+
+// ── Directory scan ────────────────────────────────────────────────────────────
+
+/**
+ * Send the typed directory path to the server.
+ * Server walks the ENTIRE tree (all subdirectories) and returns all
+ * .su, .ci, .d, .o files it finds.
+ *
+ * The server route uses os.walk() which Python documents as:
+ *   "For each directory in the tree rooted at top (including top itself),
+ *    it yields a 3-tuple (dirpath, dirnames, filenames)."
+ * This means ALL subdirectories are searched automatically.
+ */
+async function scanSUPath() {
+    const pathEl  = document.getElementById('su-path');
+    const path = (pathEl ? pathEl.value : '').trim();
+    if (!path) { suScanStatus('Enter a directory path first'); return; }
+
+    suScanStatus('Scanning all subdirectories…');
     document.getElementById('su-picker').style.display = 'none';
-    document.getElementById('su-path').value = '';
-    document.getElementById('su-scan-status').textContent =
-      'Loaded ' + d.files.length + ' file' + (d.files.length !== 1 ? 's' : '');
-    updateSUDropLabel();
-    renderStackDepth();
 
-  } catch(e) {
-    alert('Load failed: ' + e.message);
-  } finally {
-    btn.textContent = '▶ Load selected'; btn.disabled = false;
-  }
+    try {
+        const fd = new FormData();
+        fd.append('path', path);
+        const res = await fetch('/scan_su', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) {
+            suScanStatus('Error: ' + d.error + (d.hint ? ' — ' + d.hint : ''));
+            return;
+        }
+
+        SU_DATA.scanResults = d;
+
+        // Show what was found before the picker
+        renderScanSummary(d);
+
+        if (d.has_su || d.has_ci) {
+            renderSUPicker(d);
+        }
+    } catch(e) {
+        suScanStatus('Network error: ' + e.message);
+    }
 }
 
-// ── Parse one .su file content ────────────────────────────────────────────
+/**
+ * Display a colour-coded summary of what the scan found.
+ * This tells the user clearly whether they have full or partial analysis.
+ */
+function renderScanSummary(d) {
+    const status = document.getElementById('su-scan-status');
+
+    const icons = { full: '✅', partial: '⚠️', none: '❌' };
+    const cols  = { full: 'var(--grn)', partial: 'var(--ora)', none: 'var(--red)' };
+
+    let html = `<span style="color:${cols[d.level]}">${icons[d.level]} ${d.summary}</span>`;
+
+    if (d.level === 'partial') {
+        html += `<br><span style="color:var(--dim);font-size:10px">
+            Add <code style="color:var(--acc)">-fcallgraph-info=su,da</code> to GCC flags
+            for worst-case call-chain analysis, then rebuild.</span>`;
+    } else if (d.level === 'none') {
+        html += `<br><span style="color:var(--dim);font-size:10px">
+            Add <code style="color:var(--acc)">-fstack-usage</code> to GCC flags
+            and rebuild. Files go in the same directory as your .o files.</span>`;
+    }
+
+    if (d.has_su && d.has_ci && d.matched > 0) {
+        html += `<br><span style="color:var(--dim);font-size:10px">
+            ${d.matched} matched .su/.ci pairs — full worst-case depth available.</span>`;
+    }
+
+    status.innerHTML = html;
+}
+
+/**
+ * Render the file picker list.
+ * Files are grouped by subdirectory for readability.
+ * .ci files are shown alongside their matching .su file.
+ */
+function renderSUPicker(d) {
+    const picker = document.getElementById('su-picker');
+    const list   = document.getElementById('su-picker-list');
+    const title  = document.getElementById('su-picker-title');
+
+    const suCount = d.su_files.length;
+    const ciCount = d.ci_files.length;
+
+    title.textContent =
+        suCount + ' .su' + (ciCount ? ' + ' + ciCount + ' .ci' : '') +
+        ' files found across all subdirectories';
+
+    list.innerHTML = '';
+
+    // Group files by directory for easier navigation
+    const dirs = {};
+    d.su_files.forEach(f => {
+        if (!dirs[f.dir]) dirs[f.dir] = { su: [], ci: [] };
+        dirs[f.dir].su.push(f);
+    });
+    d.ci_files.forEach(f => {
+        if (!dirs[f.dir]) dirs[f.dir] = { su: [], ci: [] };
+        dirs[f.dir].ci.push(f);
+    });
+
+    // Initialise selected state on scanResults
+    SU_DATA.scanResults.su_files.forEach(f => { if (f.selected === undefined) f.selected = true; });
+    SU_DATA.scanResults.ci_files.forEach(f => { if (f.selected === undefined) f.selected = true; });
+
+    // Render one group per directory
+    Object.keys(dirs).sort().forEach(dir => {
+        const group = dirs[dir];
+
+        // Directory header row
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'padding:5px 6px 2px;font-size:10px;color:var(--acc);' +
+            'font-weight:600;border-top:1px solid var(--bdr);margin-top:4px';
+        hdr.textContent = dir;
+        list.appendChild(hdr);
+
+        // .su file rows
+        group.su.forEach(f => {
+            const hasCi = dirs[dir].ci.some(c => c.stem === f.stem);
+            const row = makePickerRow(
+                f, 'su', hasCi ? '🔗' : '📄',
+                hasCi ? 'Matched .ci found — worst-case analysis available' : '',
+                SU_DATA.scanResults.su_files
+            );
+            list.appendChild(row);
+        });
+
+        // .ci-only rows (ci with no matching .su — unusual but possible)
+        group.ci.filter(c => !dirs[dir].su.some(s => s.stem === c.stem)).forEach(f => {
+            const row = makePickerRow(f, 'ci', '📊', 'Call graph only — no .su match', SU_DATA.scanResults.ci_files);
+            list.appendChild(row);
+        });
+    });
+
+    picker.style.display = '';
+}
+
+function makePickerRow(f, ext, icon, hint, listRef) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 6px;' +
+        'border-radius:4px;cursor:pointer;transition:.1s';
+    row.innerHTML =
+        `<input type="checkbox" ${f.selected ? 'checked' : ''} style="accent-color:var(--acc);flex-shrink:0">` +
+        `<span style="font-size:10px;color:${ext==='ci'?'var(--ora)':'var(--acc)'};flex-shrink:0">${icon}</span>` +
+        `<span style="font-size:11px;color:#fff;flex-shrink:0">${f.name}</span>` +
+        `<span style="font-size:10px;color:var(--dim);flex-grow:1">${hint}</span>` +
+        `<span style="font-size:10px;color:var(--dim);flex-shrink:0">${(f.size/1024).toFixed(1)}KB</span>`;
+
+    row.addEventListener('mouseenter', () => row.style.background = 'var(--s2)');
+    row.addEventListener('mouseleave', () => row.style.background = '');
+
+    const cb = row.querySelector('input');
+    const toggle = () => {
+        f.selected = !f.selected; cb.checked = f.selected;
+    };
+    cb.addEventListener('change', () => { f.selected = cb.checked; });
+    row.addEventListener('click', e => { if (e.target !== cb) toggle(); });
+    return row;
+}
+
+function suPickerSelectAll() {
+    if (!SU_DATA.scanResults) return;
+    SU_DATA.scanResults.su_files.forEach(f => f.selected = true);
+    SU_DATA.scanResults.ci_files.forEach(f => f.selected = true);
+    renderSUPicker(SU_DATA.scanResults);
+}
+function suPickerSelectNone() {
+    if (!SU_DATA.scanResults) return;
+    SU_DATA.scanResults.su_files.forEach(f => f.selected = false);
+    SU_DATA.scanResults.ci_files.forEach(f => f.selected = false);
+    renderSUPicker(SU_DATA.scanResults);
+}
+
+/**
+ * Load the files the user selected from the picker.
+ * Sends paths to the server which reads them — browser never needs filesystem access.
+ */
+async function loadSelectedSU() {
+    if (!SU_DATA.scanResults) return;
+    const selSU = SU_DATA.scanResults.su_files.filter(f => f.selected);
+    const selCI = SU_DATA.scanResults.ci_files.filter(f => f.selected);
+
+    if (!selSU.length && !selCI.length) {
+        alert('Select at least one file from the list'); return;
+    }
+
+    const btn = document.querySelector('[onclick="loadSelectedSU()"]');
+    if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
+    suScanStatus('Loading ' + (selSU.length + selCI.length) + ' files…');
+
+    try {
+        const allPaths = [
+            ...selSU.map(f => ({ path: f.path, type: 'su', name: f.name })),
+            ...selCI.map(f => ({ path: f.path, type: 'ci', name: f.name })),
+        ];
+
+        const fd = new FormData();
+        fd.append('paths', JSON.stringify(allPaths.map(f => f.path)));
+        const res = await fetch('/load_su_files', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) { suScanStatus('Error: ' + d.error); return; }
+
+        // Distribute loaded contents into .su and .ci buckets
+        d.files.forEach(f => {
+            if (f.name.endsWith('.su')) {
+                const count = parseSUFile(f.name, f.content);
+                upsertLoadedFile(f.name, count);
+            } else if (f.name.endsWith('.ci')) {
+                const idx = SU_DATA.ciContents.findIndex(c => c.name === f.name);
+                if (idx >= 0) SU_DATA.ciContents[idx] = { name: f.name, content: f.content };
+                else          SU_DATA.ciContents.push(  { name: f.name, content: f.content });
+            }
+        });
+
+        document.getElementById('su-picker').style.display = 'none';
+        updateSUDropLabel();
+
+        if (d.errors && d.errors.length) {
+            suScanStatus('Loaded with ' + d.errors.length + ' errors: ' + d.errors[0]);
+        } else {
+            suScanStatus('');
+        }
+
+        if (SU_DATA.ciContents.length) {
+            await runCallgraphAnalysis();
+        } else {
+            renderStackDepth();
+        }
+    } catch(e) {
+        suScanStatus('Load failed: ' + e.message);
+    } finally {
+        if (btn) { btn.textContent = '▶ Load selected'; btn.disabled = false; }
+    }
+}
+
+// ── .su file parsing ──────────────────────────────────────────────────────────
+
+/**
+ * Parse one GCC .su file.
+ *
+ * GCC .su format (one line per function):
+ *   path/to/source.c:lineNo:colNo:functionName   frameBytes   frameType
+ *
+ * frameType is one of:
+ *   static           — known at compile time, reliable
+ *   dynamic          — uses alloca() or VLAs, UNBOUNDED, investigate
+ *   dynamic,bounded  — dynamic but compiler proved an upper bound exists
+ *
+ * EMBEDDED ENGINEER NOTE:
+ *   Only "static" frames can be safely summed for worst-case stack calculation.
+ *   "dynamic" frames are a red flag — they can grow without bound at runtime.
+ *
+ * Returns: count of functions parsed
+ */
 function parseSUFile(filename, content) {
-  const slashPos = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
-  const shortName = slashPos >= 0 ? filename.slice(slashPos + 1) : filename;
-  let count = 0;
-  for (const line of content.split('\n')) {
-    const m = line.match(/^([^:]+):(\d+):\d+:(\S+)\s+(\d+)\s+(\S+)/);
-    if (!m) continue;
-    // Upsert: update existing entry if re-loading same file
-    const idx = SU_DATA.entries.findIndex(e => e.func === m[3] && e.file === shortName);
-    const entry = { file: shortName, line: parseInt(m[2]), func: m[3],
-                    size: parseInt(m[4]), type: m[5].replace(',', ' ') };
-    if (idx >= 0) SU_DATA.entries[idx] = entry;
-    else SU_DATA.entries.push(entry);
-    count++;
-  }
-  return count;
+    const slash = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
+    const shortName = slash >= 0 ? filename.slice(slash + 1) : filename;
+    let count = 0;
+
+    for (const line of content.split('\n')) {
+        // Match: "path/file.c:NN:NN:funcName   NNN   type"
+        const m = line.match(/^([^:]+):(\d+):\d+:(\S+)\s+(\d+)\s+(\S+)/);
+        if (!m) continue;
+
+        const entry = {
+            file: shortName,
+            line: parseInt(m[2]),
+            func: m[3],
+            size: parseInt(m[4]),
+            // Normalise "dynamic,bounded" → "dynamic bounded" for easier display
+            type: m[5].replace(',', ' '),
+        };
+
+        // Upsert: update existing entry if the same file is re-loaded
+        const idx = SU_DATA.entries.findIndex(
+            e => e.func === entry.func && e.file === shortName
+        );
+        if (idx >= 0) SU_DATA.entries[idx] = entry;
+        else          SU_DATA.entries.push(entry);
+        count++;
+    }
+    return count;
 }
 
-// ── Clear all loaded data ─────────────────────────────────────────────────
-function clearSUData() {
-  SU_DATA.entries     = [];
-  SU_DATA.filtered    = [];
-  SU_DATA.loadedFiles = [];
-  SU_DATA.scanResults = [];
-  document.getElementById('stack-content').style.display     = 'none';
-  document.getElementById('su-loaded-list').style.display    = 'none';
-  document.getElementById('su-clear-btn').style.display      = 'none';
-  document.getElementById('su-file-count').textContent       = '';
-  document.getElementById('su-drop-label').textContent       = 'Drop .su files here (multiple OK) — or click to browse';
-  document.getElementById('su-scan-status').textContent      = '';
-  document.getElementById('su-picker').style.display         = 'none';
+// ── Callgraph analysis (Level 2) ──────────────────────────────────────────────
+
+/**
+ * Send loaded .ci contents to the server for worst-case stack computation.
+ * The server uses callgraph_parser.py to run DFS over the call graph.
+ * Results are merged back into the UI alongside the .su frame sizes.
+ */
+async function runCallgraphAnalysis() {
+    suScanStatus('Computing worst-case call chains…');
+    try {
+        const fd = new FormData();
+        fd.append('ci_contents', JSON.stringify(SU_DATA.ciContents));
+        fd.append('su_entries',  JSON.stringify(SU_DATA.entries));
+        const res = await fetch('/analyse_callgraph', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) {
+            suScanStatus('Callgraph error: ' + d.error);
+            // Still show .su data even if .ci analysis failed
+            renderStackDepth();
+            return;
+        }
+
+        SU_DATA.cgResult = d;
+        suScanStatus('');
+        renderStackDepth();
+    } catch(e) {
+        suScanStatus('Callgraph request failed: ' + e.message);
+        renderStackDepth();
+    }
 }
 
-// ── Update the drop zone label and loaded file list ───────────────────────
-function updateSUDropLabel() {
-  const n = SU_DATA.loadedFiles.length;
-  const total = SU_DATA.entries.length;
-  document.getElementById('su-drop-label').textContent =
-    n + ' file' + (n !== 1 ? 's' : '') + ' loaded (' + total + ' functions) — drop more to add';
-  document.getElementById('su-file-count').textContent = n + ' file' + (n !== 1 ? 's' : '');
-  document.getElementById('su-clear-btn').style.display = '';
+// ── Rendering ─────────────────────────────────────────────────────────────────
 
-  // Show loaded file chips
-  const listEl  = document.getElementById('su-loaded-list');
-  const itemsEl = document.getElementById('su-loaded-items');
-  listEl.style.display = '';
-  itemsEl.innerHTML = '';
-  SU_DATA.loadedFiles.forEach(f => {
-    const chip = document.createElement('div');
-    chip.style.cssText = 'display:flex;align-items:center;gap:5px;background:var(--s2);' +
-      'border:1px solid var(--bdr);border-radius:4px;padding:2px 8px;font-size:11px;' +
-      'color:#8b949e;white-space:nowrap';
-    chip.innerHTML = '<span>' + f.name + '</span>' +
-      '<span style="color:var(--dim)">(' + f.count + ')</span>' +
-      '<span style="cursor:pointer;color:var(--dim);padding:0 2px" title="Remove this file">✕</span>';
-    chip.querySelector('span:last-child').addEventListener('click', () => removeSUFile(f.name));
-    itemsEl.appendChild(chip);
-  });
-}
-
-// ── Remove a single loaded file ───────────────────────────────────────────
-function removeSUFile(filename) {
-  SU_DATA.entries     = SU_DATA.entries.filter(e => e.file !== filename);
-  SU_DATA.loadedFiles = SU_DATA.loadedFiles.filter(f => f.name !== filename);
-  if (SU_DATA.loadedFiles.length) {
-    updateSUDropLabel();
-    renderStackDepth();
-  } else {
-    clearSUData();
-  }
-}
-
+/**
+ * Main render function for the Stack Depth tab.
+ * Adapts its output based on what data is available:
+ *   - .su only  → shows frame sizes, flags unbounded frames
+ *   - .su + .ci → additionally shows worst-case totals and call chains
+ */
 function renderStackDepth() {
-  if (!SU_DATA.entries.length) return;
-  $('stack-no-data').style.display = 'none';
-  $('stack-content').style.display = '';
+    if (!SU_DATA.entries.length) return;
 
-  const entries = SU_DATA.entries;
-  const maxSize = Math.max(...entries.map(e => e.size), 1);
-  const totalFuncs = entries.length;
-  const unbounded = entries.filter(e => e.type.includes('dynamic') && !e.type.includes('bounded'));
-  const worstCase = entries.filter(e => e.type === 'static').reduce((m, e) => Math.max(m, e.size), 0);
+    $('stack-content').style.display = '';
 
-  $('stack-stats').innerHTML = `
-    <div class="stat"><div class="snum">${totalFuncs}</div><div class="slbl">Functions analysed</div></div>
-    <div class="stat"><div class="snum" style="color:var(--grn)">${worstCase}</div><div class="slbl">Largest static frame (bytes)</div></div>
-    <div class="stat"><div class="snum" style="color:${unbounded.length?'var(--red)':'var(--grn)'}">${unbounded.length}</div>
-      <div class="slbl">Unbounded dynamic frames<br>${unbounded.length?'⚠ investigate these':'✓ none found'}</div></div>
-    <div class="stat"><div class="snum" style="color:var(--dim)">${entries.filter(e=>e.type.includes('dynamic')&&e.type.includes('bounded')).length}</div>
-      <div class="slbl">Bounded dynamic frames</div></div>`;
+    const entries    = SU_DATA.entries;
+    const cg         = SU_DATA.cgResult;   // null if no .ci files
+    const hasCG      = cg !== null;
 
-  // Unbounded card
-  const ubCard = $('stack-unbounded-card');
-  ubCard.style.display = unbounded.length ? '' : 'none';
-  const ubBody = $('stack-unbounded');
-  ubBody.innerHTML = '';
-  unbounded.forEach(e => {
-    const tr = document.createElement('tr');
-    tr.className = 'stack-unbounded-row clickable';
-    tr.innerHTML = `<td style="font-size:11px">${e.func}</td><td class="dim" style="font-size:11px">${e.file}:${e.line}</td>`;
-    ubBody.appendChild(tr);
-  });
+    // ── Stats cards ─────────────────────────────────────────────────────
+    const totalFuncs   = entries.length;
+    const unbounded    = entries.filter(e => e.type.includes('dynamic') && !e.type.includes('bounded'));
+    const maxFrame     = Math.max(...entries.map(e => e.size), 0);
+    const maxWorstCase = hasCG
+        ? Math.max(...Object.values(cg.worst_case).map(v => v.worst_case), 0)
+        : maxFrame;
 
-  filterStack();
+    $('stack-stats').innerHTML = `
+        <div class="stat">
+            <div class="snum">${totalFuncs}</div>
+            <div class="slbl">Functions analysed</div>
+        </div>
+        <div class="stat">
+            <div class="snum" style="color:var(--grn)">${maxFrame}</div>
+            <div class="slbl">Largest single frame<br>(bytes, .su data)</div>
+        </div>
+        ${hasCG ? `<div class="stat">
+            <div class="snum" style="color:var(--acc)">${maxWorstCase}</div>
+            <div class="slbl">Worst-case call chain<br>(bytes, .ci data)</div>
+        </div>` : `<div class="stat" style="opacity:0.5">
+            <div class="snum">—</div>
+            <div class="slbl">Worst-case chain<br>add -fcallgraph-info=su,da</div>
+        </div>`}
+        <div class="stat">
+            <div class="snum" style="color:${unbounded.length ? 'var(--red)' : 'var(--grn)'}">
+                ${unbounded.length}
+            </div>
+            <div class="slbl">Unbounded dynamic frames<br>${unbounded.length ? '⚠ investigate' : '✓ none'}</div>
+        </div>
+        ${hasCG && cg.has_recursive ? `<div class="stat">
+            <div class="snum" style="color:var(--ora)">⟳</div>
+            <div class="slbl">Recursive calls detected<br>stack depth is unbounded</div>
+        </div>` : ''}`;
+
+    // ── Callgraph top-N panel (only when .ci data available) ─────────────
+    const cgPanel = $('stack-cg-panel');
+    if (cgPanel) {
+        if (hasCG && cg.top_worst && cg.top_worst.length) {
+            cgPanel.style.display = '';
+            const tbody = $('stack-cg-tbody');
+            tbody.innerHTML = '';
+            const absMax = cg.top_worst[0].worst_case || 1;
+            cg.top_worst.forEach(item => {
+                const pct = Math.round(item.worst_case / absMax * 100);
+                const tr = document.createElement('tr');
+                tr.className = 'clickable';
+                // Show call chain as "A → B → C"
+                const chain = item.path.join(' → ');
+                tr.innerHTML = `
+                    <td style="font-size:11px;color:#fff">${item.func}</td>
+                    <td>
+                        <span class="sz" style="margin-right:6px">${item.worst_case}</span>
+                        <div class="fill-bg" style="width:80px;display:inline-block">
+                            <div class="fill-bar" style="width:${pct * 0.8}px;background:${
+                                item.worst_case > 1024 ? 'var(--red)' :
+                                item.worst_case > 512  ? 'var(--ora)' : 'var(--grn)'
+                            }"></div>
+                        </div>
+                    </td>
+                    <td class="sz">${item.frame}</td>
+                    <td style="font-size:10px;color:var(--dim);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                        title="${chain}">${chain}</td>
+                    <td>${item.recursive
+                        ? '<span class="stack-type-badge stack-dynamic">recursive</span>' : ''}</td>`;
+                tr.addEventListener('click', () => {
+                    // Cross-tab: open symbol popup if ELF is loaded
+                    const sym = findSymbol(item.func, null);
+                    if (sym) openSymbolPopup(sym);
+                    else {
+                        // Fall back to address inspector
+                        $('a2l-addr').value = item.func;
+                        switchTab('a2l');
+                    }
+                });
+                tbody.appendChild(tr);
+            });
+        } else {
+            cgPanel.style.display = 'none';
+        }
+    }
+
+    // ── Unbounded warning card ────────────────────────────────────────────
+    const ubCard = $('stack-unbounded-card');
+    ubCard.style.display = unbounded.length ? '' : 'none';
+    const ubBody = $('stack-unbounded');
+    ubBody.innerHTML = '';
+    unbounded.forEach(e => {
+        const tr = document.createElement('tr');
+        tr.className = 'stack-unbounded-row clickable';
+        tr.innerHTML = `<td style="font-size:11px">${e.func}</td>
+            <td class="dim" style="font-size:11px">${e.file}:${e.line}</td>`;
+        tr.addEventListener('click', () => {
+            const sym = findSymbol(e.func, null);
+            if (sym) openSymbolPopup(sym);
+        });
+        ubBody.appendChild(tr);
+    });
+
+    filterStack();
 }
 
 function filterStack() {
-  const q   = ($('stack-q')?.value || '').toLowerCase();
-  const typ = $('stack-type')?.value || '';
-  SU_DATA.filtered = SU_DATA.entries.filter(e => {
-    if (q   && !e.func.toLowerCase().includes(q) && !e.file.toLowerCase().includes(q)) return false;
-    if (typ && !e.type.includes(typ)) return false;
-    return true;
-  });
-  sortAndRenderStack();
+    const q   = ($('stack-q')?.value   || '').toLowerCase();
+    const typ = $('stack-type')?.value || '';
+    SU_DATA.filtered = SU_DATA.entries.filter(e => {
+        if (q   && !e.func.toLowerCase().includes(q)
+                && !e.file.toLowerCase().includes(q)) return false;
+        if (typ && !e.type.includes(typ)) return false;
+        return true;
+    });
+    sortAndRenderStack();
 }
 
 function sortStack(col) {
-  if (SU_DATA.sortCol === col) SU_DATA.sortDir *= -1;
-  else { SU_DATA.sortCol = col; SU_DATA.sortDir = -1; }
-  sortAndRenderStack();
+    // When sorting by worst_case but no .ci data, fall back to size
+    if (col === 'worst_case' && !SU_DATA.cgResult) col = 'size';
+    if (SU_DATA.sortCol === col) SU_DATA.sortDir *= -1;
+    else { SU_DATA.sortCol = col; SU_DATA.sortDir = -1; }
+    sortAndRenderStack();
 }
 
 function sortAndRenderStack() {
-  const { sortCol: col, sortDir: dir } = SU_DATA;
-  const sorted = [...SU_DATA.filtered].sort((a, b) => {
-    const va = col === 'size' ? a.size : (a[col] || '');
-    const vb = col === 'size' ? b.size : (b[col] || '');
-    return (typeof va === 'number' ? va - vb : va.toString().localeCompare(vb.toString())) * dir;
-  });
+    const { sortCol: col, sortDir: dir } = SU_DATA;
+    const cg = SU_DATA.cgResult;
 
-  $('stack-cnt').textContent = `${sorted.length} / ${SU_DATA.entries.length}`;
-  const tbody = $('stack-tbody'); tbody.innerHTML = '';
-  const maxSize = Math.max(...SU_DATA.entries.map(e => e.size), 1);
-
-  sorted.slice(0, 500).forEach(e => {
-    const typeClass = e.type.includes('unbounded') || (e.type.includes('dynamic') && !e.type.includes('bounded'))
-      ? 'stack-dynamic' : e.type.includes('bounded') ? 'stack-bounded' : 'stack-static';
-    const barW = Math.round(e.size / maxSize * 80);
-    const tr = document.createElement('tr'); tr.className = 'clickable';
-    tr.innerHTML = `
-      <td style="font-size:11px;color:#fff">${e.func}</td>
-      <td>
-        <span class="sz" style="margin-right:6px">${e.size}</span>
-        <div class="fill-bg" style="width:80px;display:inline-block">
-          <div class="fill-bar" style="width:${barW}px;background:${
-            e.size > 1024 ? 'var(--red)' : e.size > 256 ? 'var(--ora)' : 'var(--grn)'}"></div>
-        </div>
-      </td>
-      <td><span class="stack-type-badge ${typeClass}">${e.type}</span></td>
-      <td class="dim" style="font-size:10px">${e.file}:${e.line}</td>`;
-    // Click to jump to address inspector with symbol name lookup
-    tr.addEventListener('click', () => {
-      const sym = S.syms.find(s => s.name === e.func || s.name.endsWith(e.func));
-      if (sym) openSymbolPopup(sym);
+    const sorted = [...SU_DATA.filtered].sort((a, b) => {
+        let va, vb;
+        if (col === 'size') {
+            va = a.size; vb = b.size;
+        } else if (col === 'worst_case') {
+            // Merge .ci worst-case into sort value; fall back to .su frame size
+            va = cg?.worst_case[a.func]?.worst_case ?? a.size;
+            vb = cg?.worst_case[b.func]?.worst_case ?? b.size;
+        } else {
+            va = a[col] || ''; vb = b[col] || '';
+        }
+        return (typeof va === 'number' ? va - vb : va.toString().localeCompare(vb.toString())) * dir;
     });
-    tbody.appendChild(tr);
-  });
+
+    $('stack-cnt').textContent = `${sorted.length} / ${SU_DATA.entries.length}`;
+
+    const tbody   = $('stack-tbody');
+    tbody.innerHTML = '';
+    const maxSize = Math.max(...SU_DATA.entries.map(e => e.size), 1);
+    const hasCG   = !!cg;
+
+    sorted.slice(0, 500).forEach(e => {
+        const typeClass =
+            e.type.includes('dynamic') && !e.type.includes('bounded') ? 'stack-dynamic' :
+            e.type.includes('bounded')                                  ? 'stack-bounded' :
+                                                                          'stack-static';
+        const barW = Math.round(e.size / maxSize * 80);
+        const wc   = hasCG ? cg.worst_case[e.func] : null;
+        const wcStr = wc ? `${wc.worst_case}` : '—';
+        const wcCol = !wc ? 'var(--dim)' :
+                      wc.worst_case > 1024 ? 'var(--red)' :
+                      wc.worst_case > 512  ? 'var(--ora)' : 'var(--grn)';
+        const chainStr = wc && wc.path.length > 1
+            ? wc.path.slice(1).join(' → ')
+            : '';
+
+        const tr = document.createElement('tr');
+        tr.className = 'clickable';
+        tr.innerHTML = `
+            <td style="font-size:11px;color:#fff">${e.func}</td>
+            <td>
+                <span class="sz" style="margin-right:6px">${e.size}</span>
+                <div class="fill-bg" style="width:80px;display:inline-block">
+                    <div class="fill-bar" style="width:${barW}px;background:${
+                        e.size > 1024 ? 'var(--red)' : e.size > 256 ? 'var(--ora)' : 'var(--grn)'
+                    }"></div>
+                </div>
+            </td>
+            <td style="color:${wcCol};font-weight:${wc?'600':'400'}">${wcStr}</td>
+            <td><span class="stack-type-badge ${typeClass}">${e.type}</span></td>
+            <td class="dim" style="font-size:10px">${e.file}:${e.line}</td>
+            <td style="font-size:10px;color:var(--dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                title="${chainStr}">${chainStr}</td>`;
+
+        tr.addEventListener('click', () => {
+            // Link to ELF symbol popup when ELF is loaded
+            const sym = findSymbol(e.func, null);
+            if (sym) openSymbolPopup(sym);
+            else {
+                // Link to stack depth tab isn't circular — click opens symbol search
+                $('sym-q').value = e.func;
+                filterSyms();
+                switchTab('sym');
+            }
+        });
+        tbody.appendChild(tr);
+    });
 }
 
 function exportStackCSV() {
-  const lines = ['Function,Stack bytes,Type,File,Line'];
-  SU_DATA.filtered.forEach(e => lines.push(`"${e.func}","${e.size}","${e.type}","${e.file}","${e.line}"`));
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([lines.join('\n')], {type:'text/csv'}));
-  a.download = 'stack_usage.csv'; a.click();
+    const hasCG = !!SU_DATA.cgResult;
+    const lines = ['Function,Frame bytes,Worst-case bytes,Type,File,Line,Call chain'];
+    SU_DATA.filtered.forEach(e => {
+        const wc = hasCG ? SU_DATA.cgResult.worst_case[e.func] : null;
+        lines.push(`"${e.func}","${e.size}","${wc ? wc.worst_case : ''}","${e.type}","${e.file}","${e.line}","${wc ? wc.path.join(' → ') : ''}"`);
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+    a.download = 'stack_usage.csv';
+    a.click();
+}
+
+// ── State management helpers ──────────────────────────────────────────────────
+
+function upsertLoadedFile(name, count) {
+    const ex = SU_DATA.loadedFiles.find(f => f.name === name);
+    if (ex) ex.count = count;
+    else    SU_DATA.loadedFiles.push({ name, count });
+}
+
+function updateSUDropLabel() {
+    const n = SU_DATA.loadedFiles.length;
+    const total = SU_DATA.entries.length;
+    const ci    = SU_DATA.ciContents.length;
+
+    const lblEl = document.getElementById('su-drop-label');
+    if (lblEl) lblEl.textContent =
+        `${n} .su${ci ? ' + ' + ci + ' .ci' : ''} file${n !== 1 ? 's' : ''} loaded` +
+        ` (${total} functions) — drop more to add`;
+
+    const cntEl = document.getElementById('su-file-count');
+    if (cntEl) cntEl.textContent = `${n} file${n !== 1 ? 's' : ''}${ci ? ' + ' + ci + ' .ci' : ''}`;
+
+    const clrBtn = document.getElementById('su-clear-btn');
+    if (clrBtn) clrBtn.style.display = '';
+
+    // Update loaded file chips
+    const listEl  = document.getElementById('su-loaded-list');
+    const itemsEl = document.getElementById('su-loaded-items');
+    if (listEl && itemsEl) {
+        listEl.style.display = '';
+        itemsEl.innerHTML = '';
+        SU_DATA.loadedFiles.forEach(f => {
+            const chip = document.createElement('div');
+            chip.style.cssText = 'display:flex;align-items:center;gap:5px;background:var(--s2);' +
+                'border:1px solid var(--bdr);border-radius:4px;padding:2px 8px;font-size:11px;' +
+                'color:#8b949e';
+            chip.innerHTML = `<span>${f.name}</span>` +
+                `<span style="color:var(--dim)">(${f.count})</span>` +
+                `<span style="cursor:pointer;color:var(--dim)" title="Remove this file">✕</span>`;
+            chip.querySelector('span:last-child').addEventListener('click', () => removeSUFile(f.name));
+            itemsEl.appendChild(chip);
+        });
+        // Show .ci chips too
+        SU_DATA.ciContents.forEach(f => {
+            const chip = document.createElement('div');
+            chip.style.cssText = 'display:flex;align-items:center;gap:5px;background:var(--s2);' +
+                'border:1px solid #5a3010;border-radius:4px;padding:2px 8px;font-size:11px;color:var(--ora)';
+            chip.innerHTML = `<span>📊 ${f.name}</span>` +
+                `<span style="cursor:pointer;color:var(--dim)" title="Remove .ci file">✕</span>`;
+            chip.querySelector('span:last-child').addEventListener('click', () => removeCIFile(f.name));
+            itemsEl.appendChild(chip);
+        });
+    }
+}
+
+function removeSUFile(filename) {
+    SU_DATA.entries     = SU_DATA.entries.filter(e => e.file !== filename);
+    SU_DATA.loadedFiles = SU_DATA.loadedFiles.filter(f => f.name !== filename);
+    if (SU_DATA.loadedFiles.length) {
+        updateSUDropLabel();
+        SU_DATA.cgResult = null;  // invalidate callgraph — frame data changed
+        if (SU_DATA.ciContents.length) runCallgraphAnalysis();
+        else renderStackDepth();
+    } else {
+        clearSUData();
+    }
+}
+
+function removeCIFile(filename) {
+    SU_DATA.ciContents = SU_DATA.ciContents.filter(c => c.name !== filename);
+    SU_DATA.cgResult   = null;
+    updateSUDropLabel();
+    if (SU_DATA.ciContents.length) runCallgraphAnalysis();
+    else renderStackDepth();
+}
+
+function clearSUData() {
+    SU_DATA.entries      = [];
+    SU_DATA.filtered     = [];
+    SU_DATA.loadedFiles  = [];
+    SU_DATA.scanResults  = null;
+    SU_DATA.ciContents   = [];
+    SU_DATA.cgResult     = null;
+
+    ['stack-content','su-loaded-list','su-picker'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    const clr = document.getElementById('su-clear-btn');
+    if (clr) clr.style.display = 'none';
+    const cnt = document.getElementById('su-file-count');
+    if (cnt) cnt.textContent = '';
+    const lbl = document.getElementById('su-drop-label');
+    if (lbl) lbl.textContent = 'Drop .su or .ci files here (multiple OK) — or click to browse';
+    suScanStatus('');
+}
+
+function suScanStatus(msg) {
+    const el = document.getElementById('su-scan-status');
+    if (el) el.innerHTML = msg;
+}
+
+// =============================================================================
+// CI FORMAT DEBUGGER
+// =============================================================================
+// The GCC -fcallgraph-info=su,da format is not well-documented.
+// This tool shows the raw parsed result so we can verify the parser.
+// =============================================================================
+
+function toggleCIDebug() {
+    const body = document.getElementById('ci-debug-body');
+    if (body) body.style.display = body.style.display === 'none' ? '' : 'none';
+}
+
+async function inspectCIFormat() {
+    const text = (document.getElementById('ci-sample-text')?.value || '').trim();
+    const out  = document.getElementById('ci-debug-out');
+    if (!text) { if (out) out.textContent = 'Paste some .ci content first'; return; }
+
+    if (out) out.textContent = 'Sending to server…';
+
+    try {
+        const fd = new FormData();
+        fd.append('content', text);
+        const res = await fetch('/debug_ci', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) { if (out) out.textContent = 'Error: ' + d.error; return; }
+
+        // Show the raw lines so we can see the actual format
+        let report = `Total lines in sample: ${d.total_lines}\n\n`;
+        report += `First ${Math.min(60, d.sample.length)} lines:\n`;
+        report += '─'.repeat(60) + '\n';
+        d.sample.forEach((line, i) => {
+            report += `${String(i+1).padStart(3,'0')}: ${line}\n`;
+        });
+        report += '\n─'.repeat(60) + '\n';
+        report += 'Copy the above and send to the developer so the parser can be fixed.\n';
+        report += 'GitHub issue / email: include file name and GCC version (arm-none-eabi-gcc --version)';
+
+        if (out) out.textContent = report;
+    } catch(e) {
+        if (out) out.textContent = 'Request failed: ' + e.message;
+    }
 }

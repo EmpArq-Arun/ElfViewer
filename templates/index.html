@@ -471,7 +471,7 @@
             <input type="file" id="su-fi" accept=".su" multiple style="display:none">
             <div class="drop-area" id="su-drop">
               <div class="dico">📄</div>
-              <p id="su-drop-label">Drop .su files here (multiple OK) — or click to browse</p>
+              <p id="su-drop-label">Drop .su or .ci files here (multiple OK) — or click to browse</p>
             </div>
 
             <!-- Path scan section -->
@@ -513,6 +513,30 @@
           </div>
         </div>
 
+        <!-- CI format debugger — paste .ci content to diagnose parser -->
+        <div class="card-wrap" id="ci-debug-panel" style="margin-bottom:12px">
+          <div class="tbl-hdr">
+            🔬 .ci format inspector
+            <span class="sub">paste first 30 lines of a .ci file to diagnose</span>
+            <div class="tbl-actions">
+              <button class="hbtn" onclick="toggleCIDebug()">Show / Hide</button>
+            </div>
+          </div>
+          <div id="ci-debug-body" style="display:none;padding:12px 16px">
+            <textarea id="ci-sample-text"
+              style="width:100%;height:120px;background:var(--bg);border:1px solid var(--bdr);
+                     border-radius:4px;color:var(--acc);font:11px var(--mono);padding:8px;
+                     resize:vertical"
+              placeholder="Paste the first 30 lines of one of your .ci files here…"></textarea>
+            <button class="hbtn" style="margin-top:6px" onclick="inspectCIFormat()">
+              🔍 Inspect format
+            </button>
+            <pre id="ci-debug-out"
+              style="margin-top:8px;font-size:11px;color:#8b949e;white-space:pre-wrap;
+                     max-height:200px;overflow-y:auto"></pre>
+          </div>
+        </div>
+
         <!-- Results — shown once data is loaded -->
         <div id="stack-content" style="display:none">
           <div class="sg" id="stack-stats"></div>
@@ -533,11 +557,28 @@
             </div>
             <table><thead><tr>
               <th onclick="sortStack('func')">Function</th>
-              <th onclick="sortStack('size')">Stack bytes</th>
+              <th onclick="sortStack('size')">Frame (own)</th>
+              <th onclick="sortStack('worst_case')">Worst-case chain ▼</th>
               <th onclick="sortStack('type')">Type</th>
-              <th onclick="sortStack('file')">File</th>
+              <th onclick="sortStack('file')">File:Line</th>
+              <th>Callees (deepest path)</th>
             </tr></thead><tbody id="stack-tbody"></tbody></table>
           </div>
+          <!-- Callgraph panel — shown only when .ci files are loaded -->
+          <div class="card-wrap" id="stack-cg-panel" style="display:none">
+            <div class="tbl-hdr">
+              📊 Worst-case call chains
+              <span class="sub">requires -fcallgraph-info=su,da</span>
+            </div>
+            <table><thead><tr>
+              <th>Entry function</th>
+              <th>Worst-case (bytes)</th>
+              <th>Own frame</th>
+              <th>Deepest callee path</th>
+              <th></th>
+            </tr></thead><tbody id="stack-cg-tbody"></tbody></table>
+          </div>
+
           <div class="card-wrap" id="stack-unbounded-card" style="display:none">
             <div class="tbl-hdr" style="color:var(--red)">⚠ Unbounded stack — investigate these functions</div>
             <table><thead><tr><th>Function</th><th>File</th></tr></thead>

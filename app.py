@@ -37,6 +37,7 @@ BaseRequest.MEMFILE_MAX = 10 * 1024 * 1024  # 10 MB for text form fields
 
 from parsers.ld_parser  import parse_linker_script
 from parsers.map_parser import parse_map
+from parsers.callgraph_parser import analyse_callgraph
 from parsers.elf_parser import (
     resolve_tools, save_elf, analyse_elf,
     assign_symbols, make_warnings, startup_cost, run_tool
@@ -216,68 +217,185 @@ def route_addr2line():
 
 @app.route('/scan_su', method='POST')
 def route_scan_su():
-    """Walk a directory tree and return all .su files found."""
+    """
+    Walk a directory tree and catalogue ALL analysis-relevant GCC output files.
+
+    Searches recursively for:
+        .su  → per-function stack frame sizes (needs -fstack-usage)
+        .ci  → call graph with stack costs (needs -fcallgraph-info=su,da)
+        .d   → header dependency lists (generated automatically)
+        .o   → object files (exist in every build)
+
+    Returns:
+        {
+          "su_files":  [...],   list of .su files found
+          "ci_files":  [...],   list of .ci files found
+          "d_files":   [...],   list of .d  files found
+          "o_files":   [...],   count of .o files (not listed individually)
+          "has_su":    bool,
+          "has_ci":    bool,
+          "has_d":     bool,
+          "summary":   str      human-readable description of what was found
+        }
+
+    EMBEDDED ENGINEER NOTE:
+        If has_su=True and has_ci=True  → full worst-case call-chain analysis available
+        If has_su=True and has_ci=False → per-function frame sizes only (add -fcallgraph-info=su,da)
+        If has_su=False                 → no stack data (add -fstack-usage and rebuild)
+    """
     response.content_type = 'application/json'
     try:
         path = request.forms.get('path', '').strip()
         if not path:
             return json.dumps({"error": "No path provided"})
 
-        # Expand user home dir and environment variables
+        # Support environment variables and ~ in path (useful for CI/CD paths)
         path = os.path.expandvars(os.path.expanduser(path))
 
         if not os.path.isdir(path):
-            return json.dumps({"error": f"Directory not found: {path}"})
+            return json.dumps({
+                "error": f"Directory not found: {path}",
+                "hint":  "Check the path is a build output directory (e.g. Debug/ or Release/)"
+            })
 
-        files = []
+        su_files, ci_files, d_files = [], [], []
+        o_count = 0
+
+        # os.walk recurses into ALL subdirectories automatically.
+        # We only skip hidden dirs (.git, .svn) and non-build dirs.
+        # NOTE: dirs[:] modifies the list IN PLACE — this is the correct
+        # way to prune os.walk subdirectory traversal.
         for root, dirs, fnames in os.walk(path):
-            # Skip hidden dirs and common non-build dirs
-            dirs[:] = [d for d in dirs if not d.startswith('.')
-                       and d not in ('node_modules', '.git', '__pycache__')]
+            dirs[:] = sorted(
+                d for d in dirs
+                if not d.startswith('.')
+                and d not in ('node_modules', '.git', '.svn', '__pycache__', '.vs')
+            )
+
+            rel = os.path.relpath(root, path)
+            rel = '' if rel == '.' else rel
+
             for fname in sorted(fnames):
+                full = os.path.join(root, fname)
+                size = os.path.getsize(full)
+
                 if fname.endswith('.su'):
-                    full_path = os.path.join(root, fname)
-                    rel_dir   = os.path.relpath(root, path)
-                    files.append({
-                        "path": full_path,
+                    su_files.append({
+                        "path": full,
                         "name": fname,
-                        "dir":  rel_dir if rel_dir != '.' else '(root)',
-                        "size": os.path.getsize(full_path),
+                        "stem": fname[:-3],    # filename without .su, matches .ci stem
+                        "dir":  rel or '(root)',
+                        "size": size,
                     })
+                elif fname.endswith('.ci'):
+                    ci_files.append({
+                        "path": full,
+                        "name": fname,
+                        "stem": fname[:-3],
+                        "dir":  rel or '(root)',
+                        "size": size,
+                    })
+                elif fname.endswith('.d'):
+                    d_files.append({
+                        "path": full,
+                        "name": fname,
+                        "dir":  rel or '(root)',
+                        "size": size,
+                    })
+                elif fname.endswith('.o') or fname.endswith('.obj'):
+                    o_count += 1
 
-        # Sort: shallowest first, then alphabetical
-        files.sort(key=lambda f: (f['dir'].count(os.sep), f['name']))
+        # Sort all lists: shallowest first then alphabetical
+        key = lambda f: (f['dir'].count(os.sep), f['name'])
+        su_files.sort(key=key)
+        ci_files.sort(key=key)
+        d_files.sort(key=key)
 
-        return json.dumps({"files": files, "total": len(files)})
+        # Match .ci files to .su files by stem (same base filename)
+        su_stems = {f['stem'] for f in su_files}
+        ci_stems = {f['stem'] for f in ci_files}
+        matched  = su_stems & ci_stems    # files that have both .su and .ci
 
+        # Build human-readable summary for the UI
+        has_su = len(su_files) > 0
+        has_ci = len(ci_files) > 0
+        has_d  = len(d_files)  > 0
+
+        if has_su and has_ci:
+            summary = (
+                f"Found {len(su_files)} .su and {len(ci_files)} .ci files "
+                f"({len(matched)} matched pairs). "
+                f"Full worst-case call-chain analysis available."
+            )
+            level = "full"
+        elif has_su:
+            summary = (
+                f"Found {len(su_files)} .su files but no .ci files. "
+                f"Per-function stack frames available. "
+                f"Add -fcallgraph-info=su,da for worst-case call-chain analysis."
+            )
+            level = "partial"
+        else:
+            summary = (
+                f"No .su files found in {path}. "
+                f"Add -fstack-usage to GCC flags and rebuild."
+            )
+            level = "none"
+
+        return json.dumps({
+            "su_files":  su_files,
+            "ci_files":  ci_files,
+            "d_files":   d_files,   # not used by UI yet, but available
+            "o_count":   o_count,
+            "has_su":    has_su,
+            "has_ci":    has_ci,
+            "has_d":     has_d,
+            "matched":   len(matched),
+            "level":     level,      # "full" | "partial" | "none"
+            "summary":   summary,
+        })
+
+    except PermissionError as ex:
+        return json.dumps({"error": f"Permission denied: {ex.filename}"})
     except Exception as ex:
-        return json.dumps({"error": str(ex)})
+        import traceback
+        return json.dumps({"error": str(ex), "trace": traceback.format_exc()})
 
 
 @app.route('/load_su_files', method='POST')
 def route_load_su_files():
-    """Read the content of selected .su files and return them."""
+    """
+    Read the contents of selected .su and .ci files and return them.
+
+    Accepts .su files (stack frame data) AND .ci files (call graph data).
+    Both are plain text — same read logic, different consumer on the JS side.
+    """
     response.content_type = 'application/json'
     try:
         paths = json.loads(request.forms.get('paths', '[]'))
         if not paths:
             return json.dumps({"error": "No paths provided"})
 
-        files = []
+        files  = []
         errors = []
         for path in paths:
             path = os.path.expandvars(os.path.expanduser(path))
             if not os.path.isfile(path):
                 errors.append(f"Not found: {path}")
                 continue
-            if not path.endswith('.su'):
-                errors.append(f"Not a .su file: {path}")
+            # Accept .su (stack usage) and .ci (call graph info) — both plain text
+            if not (path.endswith('.su') or path.endswith('.ci')):
+                errors.append(f"Unsupported file type (expected .su or .ci): {path}")
                 continue
             try:
-                with open(path, 'r', errors='replace') as f:
-                    content = f.read()
-                files.append({"name": os.path.basename(path),
-                              "path": path, "content": content})
+                with open(path, 'r', errors='replace') as fh:
+                    content = fh.read()
+                files.append({
+                    "name":    os.path.basename(path),
+                    "path":    path,
+                    "content": content,
+                    "type":    "ci" if path.endswith('.ci') else "su",
+                })
             except Exception as e:
                 errors.append(f"{path}: {e}")
 
@@ -285,6 +403,73 @@ def route_load_su_files():
 
     except Exception as ex:
         return json.dumps({"error": str(ex)})
+
+
+
+@app.route('/debug_ci', method='POST')
+def route_debug_ci():
+    """
+    Debug route: returns the first 60 lines of an uploaded .ci file
+    so we can see the actual GCC format and fix the parser accordingly.
+    """
+    response.content_type = 'application/json'
+    try:
+        content = request.forms.get('content', '')
+        if not content:
+            up = request.files.get('file')
+            if up:
+                up.file.seek(0)
+                content = up.file.read().decode('utf-8', errors='replace')
+        lines   = content.splitlines()
+        return json.dumps({
+            "total_lines": len(lines),
+            "sample":      lines[:60],
+            "raw60":       content[:3000],
+        })
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
+
+
+@app.route('/analyse_callgraph', method='POST')
+def route_analyse_callgraph():
+    """
+    Parse uploaded .ci files and compute worst-case stack depths.
+
+    Accepts:
+        ci_contents  JSON array of {name, content} objects
+        su_entries   JSON array of already-parsed .su entries (for frame-size fallback)
+
+    Returns callgraph analysis from callgraph_parser.analyse_callgraph().
+
+    SOFTWARE ENGINEER NOTE:
+        This route does the heavy computation server-side so the browser
+        doesn't need to implement a graph algorithm. The result is a simple
+        dict that the frontend renders as a table + call-chain visualisation.
+    """
+    response.content_type = 'application/json'
+    try:
+        ci_list   = json.loads(request.forms.get('ci_contents', '[]'))
+        su_list   = json.loads(request.forms.get('su_entries',  '[]'))
+
+        if not ci_list:
+            return json.dumps({"error": "No .ci file contents provided"})
+
+        contents = [item['content'] for item in ci_list if 'content' in item]
+        result   = analyse_callgraph(contents, su_list or None)
+
+        if result is None:
+            return json.dumps({"error": "Callgraph analysis produced no results"})
+
+        # top_worst path lists can be large — truncate to 10 steps for the UI
+        for item in result.get('top_worst', []):
+            if len(item.get('path', [])) > 10:
+                item['path'] = item['path'][:10] + ['...']
+
+        return json.dumps(result)
+
+    except Exception as ex:
+        import traceback
+        return json.dumps({"error": str(ex), "trace": traceback.format_exc()})
 
 
 
