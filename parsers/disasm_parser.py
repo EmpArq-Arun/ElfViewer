@@ -335,16 +335,45 @@ def disassemble(
                 break
 
     # ── addr2line for exact source location ──────────────────────────────
+    # addr2line may return '??' or empty when:
+    #   a) Address is not in debug info (genuinely no source)
+    #   b) Source paths can't be resolved on this machine (needs -d)
+    #   c) arm-none-eabi-addr2line version quirk
+    # We try multiple invocations in order of preference.
     source_file, source_line = '', 0
-    a2l_args = [addr2line, '-e', tmp_path, '-f', '-C', '-p', hex(target_aligned)]
-    if source_dir:
-        a2l_args += ['-d', source_dir]
-    a2l_out, _, _ = run_tool(a2l_args, timeout=10)
-    if a2l_out.strip() and '??' not in a2l_out:
-        m = re.search(r'at (.+):(\d+)', a2l_out)
+
+    def _try_a2l(extra_args):
+        """Run addr2line and return (file, line) or ('','0')."""
+        args = [addr2line, '-e', tmp_path, '-f', '-C', '-p',
+                hex(target_aligned)] + extra_args
+        out, _, rc = run_tool(args, timeout=10)
+        if not out.strip() or '??' in out:
+            return '', 0
+        m = re.search(r' at (.+):(\d+)', out)
+        if not m:
+            m = re.search(r'(.+):(\d+)', out)   # fallback: no 'at' prefix
         if m:
-            source_file = _normalise_source_path(m.group(1))
-            source_line = int(m.group(2))
+            return _normalise_source_path(m.group(1)), int(m.group(2))
+        return '', 0
+
+    # Attempt 1: with source_dir (highest chance of path resolution)
+    if source_dir:
+        source_file, source_line = _try_a2l(['-d', source_dir])
+
+    # Attempt 2: without -d (returns raw DWARF path; often works when
+    # the ELF was built on this same machine or paths are absolute)
+    if not source_file:
+        source_file, source_line = _try_a2l([])
+
+    # Attempt 3: fall back to path extracted from objdump --source output.
+    # When addr2line fails entirely, objdump's source_loc records (if -g was used)
+    # already have the file:line info from the same DWARF tables.
+    if not source_file and target_source_line:
+        for r in instructions:
+            if r['type'] == 'source_loc' and r.get('file') and r.get('line'):
+                source_file = _normalise_source_path(r['file'])
+                source_line = r['line']
+                break
 
     # ── Fault analysis ────────────────────────────────────────────────────
     fault_analysis = None

@@ -2059,6 +2059,11 @@ let _lastDisasmResult   = null;
 let _lastDisasmAddr     = 0;
 let _disasmShowFull     = false;   // false = N-line context, true = full function
 
+// Cache of addr2line results keyed by hex address string.
+// Populated when addr2line succeeds; reused when it returns empty on re-inspect.
+// This avoids flaky results when source_dir is temporarily unavailable.
+const _a2lCache = {};   // { '0x40CB00': { source_file, source_line } }
+
 /**
  * Fetch and render disassembly for a given address.
  * Called from inspectAddress() after the four-card results are shown.
@@ -2092,8 +2097,13 @@ async function fetchDisassembly(addrInt, symResult, sourceDir) {
     // Pick up source dir: explicit arg → field value → sessionStorage
     const srcDir = sourceDir
         || (document.getElementById('ai-src-dir')?.value || '').trim()
-        || sessionStorage.getItem('lmv_src_dir') || '';
-    if (srcDir) sessionStorage.setItem('lmv_src_dir', srcDir);
+        || localStorage.getItem('lmv_src_dir')    // survives browser restart
+        || sessionStorage.getItem('lmv_src_dir')  // fallback
+        || '';
+    if (srcDir) {
+        localStorage.setItem('lmv_src_dir', srcDir);    // persist across sessions
+        sessionStorage.setItem('lmv_src_dir', srcDir);  // also session-scoped
+    }
 
     const tools = {
         nm:      ($('t-nm')?.value   || '').trim() || 'arm-none-eabi-nm',
@@ -2137,6 +2147,22 @@ async function fetchDisassembly(addrInt, symResult, sourceDir) {
                 `<div style="padding:14px;color:var(--red)">❌ ${_escHtml(d.error)}</div>`;
             appendDisasmDebug({ error: d.error, addr: '0x'+addrInt.toString(16) });
             return;
+        }
+
+        // ── Cache addr2line result for this address ───────────────────────
+        // When addr2line succeeds, cache the result.
+        // When it fails (returns empty), restore from cache so UI is consistent.
+        const addrKey = '0x' + addrInt.toString(16).toUpperCase();
+        if (d.source_file && d.source_line) {
+            // Good result — store it
+            _a2lCache[addrKey] = {
+                source_file: d.source_file,
+                source_line: d.source_line,
+            };
+        } else if (_a2lCache[addrKey]) {
+            // addr2line returned nothing this time but we have a previous good result
+            const cached = _a2lCache[addrKey];
+            d = { ...d, source_file: cached.source_file, source_line: cached.source_line };
         }
 
         // Store raw server result — inject will read this via d._base
@@ -2520,8 +2546,8 @@ function initSourceDrop() {
     drop.addEventListener('click', e => { if (e.target !== inp) inp.click(); });
     inp.addEventListener('change', e => { onSourceFilePick(e.target.files); inp.value = ''; });
 
-    // Restore last-used directory from sessionStorage
-    const saved = sessionStorage.getItem('lmv_src_dir');
+    // Restore last-used directory (localStorage survives restart; sessionStorage is fallback)
+    const saved = localStorage.getItem('lmv_src_dir') || sessionStorage.getItem('lmv_src_dir');
     if (saved) {
         const el = document.getElementById('ai-src-dir');
         if (el) el.value = saved;
@@ -2550,8 +2576,9 @@ async function scanSourceDir() {
             return;
         }
 
-        // Save path for session persistence
+        // Save path persistently (localStorage = survives restart; sessionStorage = tab)
         _srcRootPath = path;
+        localStorage.setItem('lmv_src_dir', path);
         sessionStorage.setItem('lmv_src_dir', path);
 
         _srcScanResults = d.files.map(f => ({ ...f, selected: _shouldAutoSelect(f) }));
@@ -2912,8 +2939,8 @@ function updateSourceBar(d) {
     const needsSource = !d.has_source && !!d.source_file;
     const reopenBtn   = document.getElementById('ai-src-reopen');
 
-    // Restore session-stored directory path
-    const saved = sessionStorage.getItem('lmv_src_dir');
+    // Restore persisted source dir (localStorage survives browser restart)
+    const saved = localStorage.getItem('lmv_src_dir') || sessionStorage.getItem('lmv_src_dir');
     const pathEl = document.getElementById('ai-src-dir');
     if (pathEl && saved && !pathEl.value) pathEl.value = saved;
 
@@ -3436,6 +3463,7 @@ function appendDisasmDebug(d) {
     const entry = {
         ts:                   new Date().toISOString().slice(11,23),
         addr:                 d.addr || ('0x' + (_lastDisasmAddr||0).toString(16).toUpperCase()),
+        cache_hit:            !!(_a2lCache['0x' + (_lastDisasmAddr||0).toString(16).toUpperCase()]),
         error:                d.error || null,
         source_file:          d.source_file || '(none)',
         source_line:          d.source_line || 0,
@@ -3481,7 +3509,7 @@ function renderDisasmDebug() {
             lines.push('');
             return;
         }
-        lines.push(`  Address:         ${e.addr}`);
+        lines.push(`  Address:         ${e.addr}${e.cache_hit ? ' (cached addr2line result available)' : ''}`);
         lines.push(`  Aligned addr:    ${e.target_addr_aligned}`);
         lines.push(`  Func bounds:     ${e.func_start} – ${e.func_end} (${e.instruction_count} instructions)`);
         lines.push(`  source_file:     ${e.source_file}`);
