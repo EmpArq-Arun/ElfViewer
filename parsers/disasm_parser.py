@@ -90,8 +90,44 @@ EMBEDDED ENGINEER NOTES:
     Enter these in the Address Inspector to see what was executing there.
 """
 
+import os
 import re
 from typing import Optional
+
+
+def _normalise_source_path(path: str) -> str:
+    """
+    Normalise a source path from addr2line or DWARF that may contain
+    mixed separators and relative components like "../".
+
+    Examples:
+        E:/Code/Debug_FLASH/../FreeRTOS/Source/tasks.c
+            -> E:/Code/FreeRTOS/Source/tasks.c
+
+        /home/user/project/build/../../src/main.c
+            -> /home/user/project/src/main.c
+
+    Strategy:
+        1. Replace all backslashes with forward slashes
+        2. Use os.path.normpath to resolve .. components
+        3. Restore forward slashes (normpath uses OS separator on Windows)
+    """
+    if not path:
+        return path
+
+    # Replace Windows backslashes with forward slashes first
+    p = path.replace('\\', '/').replace('\\', '/')
+
+    # Handle mixed: E:/Code/Debug_FLASH/../FreeRTOS/tasks.c
+    # os.path.normpath resolves .. correctly on both platforms
+    # but returns OS-native separators, so normalise back to forward slashes
+    try:
+        normalised = os.path.normpath(p)
+        # Convert back to forward slashes for consistency
+        normalised = normalised.replace('\\', '/')
+        return normalised
+    except Exception:
+        return p
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +343,7 @@ def disassemble(
     if a2l_out.strip() and '??' not in a2l_out:
         m = re.search(r'at (.+):(\d+)', a2l_out)
         if m:
-            source_file = m.group(1)
+            source_file = _normalise_source_path(m.group(1))
             source_line = int(m.group(2))
 
     # ── Fault analysis ────────────────────────────────────────────────────

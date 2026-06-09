@@ -774,6 +774,22 @@ window.addEventListener('beforeunload', stopServer);
         </p>
         <button class="hbtn" onclick="runDebug()" style="margin-bottom:12px">🔬 Run diagnostics</button>
         <div class="dbg-out" id="dbg-out">Click Run diagnostics with an ELF loaded.</div>
+
+        <!-- Disassembly / source debug log — auto-updates on every Inspect -->
+        <div class="card-wrap" style="margin-top:14px">
+          <div class="tbl-hdr">
+            🔬 Source &amp; Disassembly debug log
+            <span class="sub">updates automatically on every Inspect</span>
+            <div class="tbl-actions">
+              <button class="hbtn" onclick="renderDisasmDebug()">Refresh</button>
+              <button class="hbtn" onclick="clearDisasmDebug()">Clear</button>
+            </div>
+          </div>
+          <pre id="disasm-dbg-out"
+            style="font:11px var(--mono);color:#8b949e;white-space:pre-wrap;
+                   overflow-y:auto;max-height:50vh;padding:10px;
+                   background:var(--bg);margin:0">No disassembly calls yet — run Inspect with an ELF loaded.</pre>
+        </div>
       </div>
 
     </div><!-- /app -->

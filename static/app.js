@@ -2279,55 +2279,102 @@ let _disasmShowFull     = false;   // false = N-line context, true = full functi
  * @param {number} addrInt     The target address (integer)
  * @param {object} symResult   Result from inspectSymbol() — used for func bounds
  */
-async function fetchDisassembly(addrInt, symResult) {
-    if (!S.elfFile) return;   // no ELF — silently skip
+
+/**
+ * Fetch and render disassembly for a given address.
+ * Single canonical definition — called from inspectAddress and rerunDisasm.
+ * Always calls updateSourceBar after render so source injection runs.
+ *
+ * @param {number} addrInt     Target address (integer)
+ * @param {object} symResult   From inspectSymbol() — provides func bounds
+ * @param {string} sourceDir   Optional source root path to pass to server
+ */
+async function fetchDisassembly(addrInt, symResult, sourceDir) {
+    if (!S.elfFile) return;
 
     _lastDisasmAddr = addrInt;
+    _disasmShowFull = false;   // reset to context view on new inspect
 
     const panel = $('ai-disasm-panel');
     const body  = $('ai-disasm-body');
-    panel.style.display = '';
-    body.innerHTML = '<div style="padding:14px;color:var(--dim)">⏳ Disassembling…</div>';
-    $('ai-fault-banner').style.display = 'none';
-    $('ai-disasm-footer').style.display = 'none';
+    if (panel) panel.style.display = '';
+    if (body)  body.innerHTML = '<div style="padding:14px;color:var(--dim)">⏳ Disassembling…</div>';
+    const faultBanner = $('ai-fault-banner');
+    if (faultBanner) faultBanner.style.display = 'none';
+
+    // Pick up source dir: explicit arg → field value → sessionStorage
+    const srcDir = sourceDir
+        || (document.getElementById('ai-src-dir')?.value || '').trim()
+        || sessionStorage.getItem('lmv_src_dir') || '';
+    if (srcDir) sessionStorage.setItem('lmv_src_dir', srcDir);
 
     const tools = {
-        nm:      $('t-nm')?.value.trim()     || 'arm-none-eabi-nm',
-        re:      $('t-re')?.value.trim()     || 'arm-none-eabi-readelf',
-        size:    $('t-sz')?.value.trim()     || 'arm-none-eabi-size',
-        a2l:     $('t-a2l')?.value.trim()    || 'arm-none-eabi-addr2line',
-        objdump: 'arm-none-eabi-objdump',    // standard name — same prefix as nm
-        prefix:  $('t-prefix')?.value.trim() || '',
+        nm:      ($('t-nm')?.value   || '').trim() || 'arm-none-eabi-nm',
+        re:      ($('t-re')?.value   || '').trim() || 'arm-none-eabi-readelf',
+        size:    ($('t-sz')?.value   || '').trim() || 'arm-none-eabi-size',
+        a2l:     ($('t-a2l')?.value  || '').trim() || 'arm-none-eabi-addr2line',
+        objdump: 'arm-none-eabi-objdump',
+        prefix:  ($('t-prefix')?.value || '').trim(),
     };
 
     const ctxLines = parseInt($('ai-ctx-lines')?.value || '10');
-
-    // Pass known function bounds from nm — avoids a second objdump scan
     const fd = new FormData();
     fd.append('elf',           S.elfFile);
     fd.append('addr',          '0x' + addrInt.toString(16));
     fd.append('context_lines', String(ctxLines));
     fd.append('tools_json',    JSON.stringify(tools));
-    if (symResult?.sym?.addr)  fd.append('func_start', '0x' + symResult.sym.addr.toString(16));
-    if (symResult?.sym?.size)  fd.append('func_end',
-        '0x' + (symResult.sym.addr + symResult.sym.size).toString(16));
+    if (srcDir) fd.append('source_dir', srcDir);
+    // Use sym result bounds first; fall back to last known bounds for this address
+    // This ensures the same function window on re-inspect even if S.syms is empty
+    const knownStart = symResult?.sym?.addr
+        || (_lastDisasmResult?.func_start && _lastDisasmAddr === addrInt
+            ? _lastDisasmResult.func_start
+            : (_lastDisasmResult?._base?.func_start && _lastDisasmAddr === addrInt
+                ? _lastDisasmResult._base.func_start : null));
+    const knownEnd   = symResult?.sym?.addr && symResult?.sym?.size
+        ? symResult.sym.addr + symResult.sym.size
+        : (_lastDisasmResult?.func_end && _lastDisasmAddr === addrInt
+            ? _lastDisasmResult.func_end
+            : (_lastDisasmResult?._base?.func_end && _lastDisasmAddr === addrInt
+                ? _lastDisasmResult._base.func_end : null));
+
+    if (knownStart) fd.append('func_start', '0x' + knownStart.toString(16));
+    if (knownEnd)   fd.append('func_end',   '0x' + knownEnd.toString(16));
 
     try {
         const res = await fetch('/disassemble', { method: 'POST', body: fd });
         const d   = await res.json();
 
         if (d.error) {
-            body.innerHTML = `<div style="padding:14px;color:var(--red)">❌ ${d.error}</div>`;
+            if (body) body.innerHTML =
+                `<div style="padding:14px;color:var(--red)">❌ ${_escHtml(d.error)}</div>`;
+            appendDisasmDebug({ error: d.error, addr: '0x'+addrInt.toString(16) });
             return;
         }
 
+        // Store raw server result — inject will read this via d._base
         _lastDisasmResult = d;
-        renderDisassembly(d, _disasmShowFull);
+
+        // Always render first so the user sees something immediately
+        renderDisassembly(d, false);
+
+        // Then try to inject source (updateSourceBar calls injectUserSourceIntoDisasm
+        // if files are in the store).  This may update _lastDisasmResult.
+        updateSourceBar(d);
+
+        // Show register panel if fault detected
+        if (d.fault_analysis) showRegPanelForFault();
+
+        // Debug log — read _lastDisasmResult which may have been updated by injection
+        appendDisasmDebug(_lastDisasmResult);
 
     } catch(e) {
-        body.innerHTML = `<div style="padding:14px;color:var(--red)">❌ Request failed: ${e.message}</div>`;
+        if (body) body.innerHTML =
+            `<div style="padding:14px;color:var(--red)">❌ ${_escHtml(e.message)}</div>`;
     }
 }
+
+
 
 /**
  * Render the disassembly listing.
@@ -2837,9 +2884,10 @@ async function loadSelectedSource() {
         d.files.forEach(f => storeSourceFile(f.name, f.content));
 
         document.getElementById('ai-src-picker').style.display = 'none';
-        setSrcStatus('');
         updateSrcChips();
         injectUserSourceIntoDisasm();
+        // Update debug log after injection so user sees fresh state
+        if (_lastDisasmResult) appendDisasmDebug(_lastDisasmResult);
     } catch(e) {
         setSrcStatus('Load failed: ' + e.message);
     } finally {
@@ -2866,6 +2914,7 @@ function onSourceFilePick(fileList) {
                     `${Object.keys(_srcStore).length} file${Object.keys(_srcStore).length !== 1 ? 's' : ''} loaded`;
                 updateSrcChips();
                 injectUserSourceIntoDisasm();
+                if (_lastDisasmResult) appendDisasmDebug(_lastDisasmResult);
             }
         };
         reader.readAsText(file);
@@ -2877,6 +2926,11 @@ function onSourceFilePick(fileList) {
 function storeSourceFile(name, content) {
     // Index 0 unused — lines[lineNumber] = text, matching 1-based line numbers
     _srcStore[name] = [''].concat(content.split('\n'));
+    // Update debug log immediately so user can see lookup result changed
+    if (_lastDisasmResult) {
+        const chk = _srcLookup(_lastDisasmResult.source_file || _lastDisasmResult._base?.source_file);
+        if (chk) setSrcStatus(`✅ "${name}" matches crash file — click Scan/Load to inject`);
+    }
 }
 
 function clearSourceFiles() {
@@ -3083,24 +3137,42 @@ function updateSourceBar(d) {
         if (hint) pathEl.placeholder = `e.g. ${hint}`;
     }
 
-    // ISSUE 1 FIX: Never auto-hide the bar once it's been shown.
-    // Only hide if user explicitly clicked ✕ (_srcBarMinimised).
-    // Always show if source is needed AND user hasn't minimised.
-    if (needsSource && !_srcBarMinimised) {
+    // Try injection immediately if we have files — this may resolve needsSource
+    if (hasStore) {
+        injectUserSourceIntoDisasm();
+    }
+
+    // Re-check after injection: _lastDisasmResult.has_source may now be true
+    const injectedOk = !!_lastDisasmResult?.has_source;
+
+    // Bar visibility logic:
+    //   - User clicked ✕ (_srcBarMinimised): always hidden, show reopen button
+    //   - Source is fully resolved (objdump OR injection): hide the warning, keep
+    //     the bar available via the 📂 Source reopen button
+    //   - Source needed and not yet resolved: show bar with orange warning
+    //   - Store has files but source resolved: collapse bar, show reopen button
+    if (_srcBarMinimised) {
+        bar.style.display = 'none';
+        if (reopenBtn) reopenBtn.style.display = '';
+    } else if (injectedOk || d.has_source) {
+        // Source resolved — hide the "⚠ Source lines not found" warning
+        // but make it easy to reopen if user wants to manage files
+        bar.style.display = 'none';
+        if (reopenBtn) {
+            reopenBtn.style.display = '';
+            reopenBtn.textContent = hasStore ? '📂 Source ✓' : '📂 Source';
+            reopenBtn.title = injectedOk
+                ? 'Source injected — click to manage source files'
+                : 'Source from ELF — click to manage source files';
+        }
+    } else if (needsSource && !_srcBarMinimised) {
+        // Source needed but not resolved — show warning bar
         bar.style.display = '';
         if (reopenBtn) reopenBtn.style.display = 'none';
     } else if (hasStore && !_srcBarMinimised) {
-        // Store has files — keep bar visible so user can manage them
+        // Store has files but this address has no source info
         bar.style.display = '';
         if (reopenBtn) reopenBtn.style.display = 'none';
-    } else if (_srcBarMinimised) {
-        bar.style.display = 'none';
-        if (reopenBtn) reopenBtn.style.display = '';
-    }
-
-    // ISSUE 2 FIX: If we have source in store for this symbol, inject immediately
-    if (hasStore) {
-        injectUserSourceIntoDisasm();
     }
 
     updateSrcChips();
@@ -3294,69 +3366,8 @@ function showRawObjdump() {
     modal.style.display = '';
 }
 
-// ── Hook into fetchDisassembly to pass source_dir ────────────────────────────
-// Override the fetchDisassembly call signature to accept optional sourceDir
-const _fetchDisasmOrig = fetchDisassembly;
-fetchDisassembly = async function(addrInt, symResult, sourceDir) {
-    if (!S.elfFile) return;
-    _lastDisasmAddr = addrInt;
+// fetchDisassembly override removed — see canonical definition above
 
-    const panel = document.getElementById('ai-disasm-panel');
-    const body  = document.getElementById('ai-disasm-body');
-    if (panel) panel.style.display = '';
-    if (body)  body.innerHTML = '<div style="padding:14px;color:var(--dim)">⏳ Disassembling…</div>';
-
-    const faultBanner = document.getElementById('ai-fault-banner');
-    if (faultBanner) faultBanner.style.display = 'none';
-
-    const srcDir = sourceDir
-        || (document.getElementById('ai-src-dir')?.value || '').trim()
-        || '';
-
-    const tools = {
-        nm:      document.getElementById('t-nm')?.value.trim()     || 'arm-none-eabi-nm',
-        re:      document.getElementById('t-re')?.value.trim()     || 'arm-none-eabi-readelf',
-        size:    document.getElementById('t-sz')?.value.trim()     || 'arm-none-eabi-size',
-        a2l:     document.getElementById('t-a2l')?.value.trim()    || 'arm-none-eabi-addr2line',
-        objdump: 'arm-none-eabi-objdump',
-        prefix:  document.getElementById('t-prefix')?.value.trim() || '',
-    };
-
-    const ctxLines = parseInt(document.getElementById('ai-ctx-lines')?.value || '10');
-    const fd = new FormData();
-    fd.append('elf', S.elfFile);
-    fd.append('addr', '0x' + addrInt.toString(16));
-    fd.append('context_lines', String(ctxLines));
-    fd.append('tools_json', JSON.stringify(tools));
-    if (srcDir) fd.append('source_dir', srcDir);
-    if (symResult?.sym?.addr)
-        fd.append('func_start', '0x' + symResult.sym.addr.toString(16));
-    if (symResult?.sym?.size)
-        fd.append('func_end',
-            '0x' + (symResult.sym.addr + symResult.sym.size).toString(16));
-
-    try {
-        const res = await fetch('/disassemble', { method: 'POST', body: fd });
-        const d   = await res.json();
-
-        if (d.error) {
-            if (body) body.innerHTML =
-                `<div style="padding:14px;color:var(--red)">❌ ${_escHtml(d.error)}</div>`;
-            return;
-        }
-
-        _lastDisasmResult = d;
-        renderDisassembly(d, _disasmShowFull);
-        updateSourceBar(d);
-
-        // Auto-show register panel if a fault pattern was detected
-        if (d.fault_analysis) showRegPanelForFault();
-
-    } catch(e) {
-        if (body) body.innerHTML =
-            `<div style="padding:14px;color:var(--red)">❌ Request failed: ${_escHtml(e.message)}</div>`;
-    }
-};
 // =============================================================================
 // ISSUE 4 & 5 — CRASH POINT POPUP + SOURCE/DISASSEMBLY POPUPS
 // =============================================================================
@@ -3613,6 +3624,112 @@ function openSymbolDisasmPopup() {
             if (el) el.scrollIntoView({ block: 'center' });
         });
     }
+}
+
+// =============================================================================
+// DISASSEMBLY DEBUG LOG
+// =============================================================================
+// Appended to the existing Debug tab. Shows exactly what the disassembly
+// subsystem received and did, so the user can report issues precisely.
+//
+// Keys shown on each entry:
+//   source_file        — path baked into ELF DWARF (what addr2line returned)
+//   source_line        — line number from addr2line
+//   target_idx         — index of crash instruction in record list
+//   target_addr_aligned— address after Thumb bit strip and alignment
+//   has_source         — did objdump -S find source lines? (needs -g in ELF)
+//   _base set          — is the clean base stored for re-inject?
+//   _srcStore keys     — which source files are currently loaded
+//   inject result      — did injectUserSourceIntoDisasm succeed?
+// =============================================================================
+
+const _disasmDebugLog = [];   // ring buffer, 20 entries max
+
+function appendDisasmDebug(d) {
+    const entry = {
+        ts:                   new Date().toISOString().slice(11,23),
+        addr:                 d.addr || ('0x' + (_lastDisasmAddr||0).toString(16).toUpperCase()),
+        error:                d.error || null,
+        source_file:          d.source_file || '(none)',
+        source_line:          d.source_line || 0,
+        target_idx:           d.target_idx ?? -1,
+        target_addr_aligned:  d.target_addr_aligned
+                                ? '0x' + d.target_addr_aligned.toString(16).toUpperCase()
+                                : '(none)',
+        has_source_from_objdump: d.has_source || false,
+        has_source_after_inject: _lastDisasmResult?.has_source || false,
+        base_set:             !!_lastDisasmResult?._base,
+        src_store_keys:       Object.keys(_srcStore),
+        src_lookup_result:    d.source_file
+            ? (_srcLookup(d.source_file)
+                ? 'FOUND ✅ — injection should work'
+                : 'NOT FOUND ❌ — need: ' + _normPath(d.source_file).split('/').pop())
+            : 'no source_file — ELF needs -g and addr2line must resolve',
+        inject_ran:           !!d._base,
+        src_line_available:   !!(d.source_line || d.target_source_line),
+        fault_pattern:        d.fault_analysis?.pattern || null,
+        instruction_count:    (d.instructions || []).filter(r=>r.type==='insn').length,
+        record_count:         (d.instructions || []).length,
+        func_start:           d.func_start ? '0x'+(d.func_start).toString(16).toUpperCase() : '(auto-detected)',
+        func_end:             d.func_end   ? '0x'+(d.func_end  ).toString(16).toUpperCase() : '(auto-detected)',
+    };
+    _disasmDebugLog.unshift(entry);
+    if (_disasmDebugLog.length > 20) _disasmDebugLog.pop();
+    renderDisasmDebug();
+}
+
+function renderDisasmDebug() {
+    const el = document.getElementById('disasm-dbg-out');
+    if (!el) return;
+    if (!_disasmDebugLog.length) {
+        el.textContent = 'No disassembly calls yet — run Inspect with an ELF loaded.';
+        return;
+    }
+
+    const lines = ['═'.repeat(60)];
+    _disasmDebugLog.forEach((e, i) => {
+        lines.push(`[${e.ts}] ${i === 0 ? '← latest' : ''}`);
+        if (e.error) {
+            lines.push(`  ❌ ERROR: ${e.error}`);
+            lines.push('');
+            return;
+        }
+        lines.push(`  Address:         ${e.addr}`);
+        lines.push(`  Aligned addr:    ${e.target_addr_aligned}`);
+        lines.push(`  Func bounds:     ${e.func_start} – ${e.func_end} (${e.instruction_count} instructions)`);
+        lines.push(`  source_file:     ${e.source_file}`);
+        lines.push(`  source_line:     ${e.source_line || '(not found by addr2line)'}`);
+        lines.push(`  target_idx:      ${e.target_idx}  (index into ${e.record_count} records)`);
+        lines.push(`  Instructions:    ${e.instruction_count}`);
+        // objdump -S result
+        lines.push(`  has_source (objdump):  ${e.has_source_from_objdump
+            ? '✅ YES — C source lines embedded in ELF (-g active)'
+            : '❌ NO — objdump could not resolve source paths (source dir mismatch or paths differ between build machine and this machine)'}`);
+        lines.push(`  has_source (injected): ${e.has_source_after_inject ? '✅ YES — source injected from _srcStore' : '❌ NO'}`);
+        lines.push(`  source line available: ${e.src_line_available ? '✅ YES — line ' + (e.source_line||0) : '❌ NO — addr2line returned nothing (address not in debug info)'}`);
+        lines.push(`  injection ran:   ${e.inject_ran
+            ? '✅ YES'
+            : '❌ NOT YET — ' + (e.src_store_keys.length === 0
+                ? 'load source files first (Scan folder or drop .c files)'
+                : e.src_lookup_result.startsWith('NOT FOUND')
+                    ? 'crash file not in store. Need: ' + (e.src_lookup_result.split('need: ')[1] || '?')
+                    : 'source_file or source_line missing from ELF debug info')}`);
+        lines.push(`  _srcStore: ${e.src_store_keys.length
+            ? e.src_store_keys.length + ' files loaded: '
+              + e.src_store_keys.slice(0,5).join(', ')
+              + (e.src_store_keys.length > 5 ? ' … +' + (e.src_store_keys.length-5) + ' more' : '')
+            : '(empty — use Scan folder in the Source panel)'}`);
+        lines.push(`  _srcLookup: ${e.src_lookup_result}`);
+        if (e.fault_pattern) lines.push(`  Fault pattern:   ${e.fault_pattern}`);
+        lines.push('  ' + '─'.repeat(56));
+    });
+
+    el.textContent = lines.join('\n');
+}
+
+function clearDisasmDebug() {
+    _disasmDebugLog.length = 0;
+    renderDisasmDebug();
 }
 
 
