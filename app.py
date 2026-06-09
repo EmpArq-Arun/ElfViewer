@@ -664,7 +664,8 @@ def open_browser(port):
 
 
 if __name__ == '__main__':
-    candidates = [5000, 5500, 7000, 7777, 8000, 8080, 8888, 9000, 3000]
+    candidates = [5000, 5500, 7000, 7777, 8000, 8080, 8888, 9000, 3000,
+                   5001, 5002, 5003, 6000, 6500, 10000, 12000, 15000]
     if len(sys.argv) > 1:
         try: candidates = [int(sys.argv[1])] + candidates
         except ValueError: pass
@@ -691,6 +692,23 @@ if __name__ == '__main__':
   ║  Ctrl+C to stop                                      ║
   ╚══════════════════════════════════════════════════════╝
 """)
+    # ISSUE 7: Add a shutdown endpoint so the browser page can stop the server.
+    # When the browser sends POST /shutdown, the server exits cleanly.
+    @app.route('/shutdown', method='POST')
+    def route_shutdown():
+        """
+        Gracefully stop the server from the browser.
+        Called by the page's beforeunload handler and the ✕ button.
+        Only accepts requests from localhost for security.
+        """
+        if request.environ.get('REMOTE_ADDR') not in ('127.0.0.1', '::1'):
+            abort(403, 'Shutdown only allowed from localhost')
+        def _stop():
+            import time; time.sleep(0.3)   # let the HTTP response finish
+            os._exit(0)
+        threading.Thread(target=_stop, daemon=True).start()
+        return json.dumps({"ok": True})
+
     threading.Thread(target=open_browser, args=(PORT,), daemon=True).start()
     run(app, host='localhost', port=PORT, quiet=True,
         max_request_size=256 * 1024 * 1024)

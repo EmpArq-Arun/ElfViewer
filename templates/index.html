@@ -7,6 +7,13 @@
 <meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Linker MemMap</title>
+<script>
+function stopServer() {
+    if (navigator.sendBeacon) { navigator.sendBeacon('/shutdown'); }
+    else { try { const x=new XMLHttpRequest(); x.open('POST','/shutdown',false); x.send(); } catch(e){} }
+}
+window.addEventListener('beforeunload', stopServer);
+</script>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 </head>
@@ -31,6 +38,12 @@
 
   <!-- ── Sidebar ── -->
   <div class="sidebar" id="sidebar">
+      <!-- Stop server button — kills background process when running as EXE -->
+      <div style="padding:6px 8px 0;display:flex;justify-content:flex-end">
+        <button class="hbtn" style="font-size:10px;color:var(--dim)"
+          onclick="if(confirm('Stop the Linker MemMap server and close?')){stopServer();setTimeout(()=>window.close(),300)}"
+          title="Stop the background server process">✕ Stop server</button>
+      </div>
 
     <!-- LD drop -->
     <div class="sb-sec">
@@ -448,6 +461,10 @@
                     <span id="ai-disasm-toggle-lbl">Full fn</span>
                   </button>
                   <button class="hbtn" onclick="showRawObjdump()">Raw</button>
+                  <button class="hbtn" id="ai-src-reopen" style="display:none;color:var(--ora)"
+                    onclick="openSrcBar()" title="Source panel was closed — click to reopen">
+                    📂 Source
+                  </button>
                   <button class="hbtn" onclick="copyDisasm()">📋 Copy</button>
                 </div>
               </div>

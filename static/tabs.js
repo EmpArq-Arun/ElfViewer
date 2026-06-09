@@ -513,7 +513,14 @@ function renderSymCard(r, addr) {
   const exact = r.reason === 'found';
 
   body.innerHTML =
-    aiRow('Name',    `<strong style="color:#fff">${sym.name}</strong>`) +
+    `<div class="ai-row" style="cursor:pointer" title="Click: view function disassembly or source"
+        onclick="openSymbolDisasmPopup()">
+      <div class="ai-row-label">Name</div>
+      <div class="ai-row-val" style="color:var(--acc);text-decoration:underline dotted;font-weight:600">
+        ${_escHtml(sym.name)}
+        <span style="color:var(--dim);font-size:10px;font-weight:400"> (click to view)</span>
+      </div>
+     </div>` +
     aiRow('Type',    `<span style="color:${col}">${sym.type}</span>${sym.global ? '' : ' <span style="color:var(--dim);font-size:10px">(local)</span>'}`) +
     aiRow('Start',   `0x${sym.addr.toString(16).toUpperCase().padStart(8,'0')}`, 'hx') +
     (sym.size ? aiRow('Size', fz(sym.size) + ` (${sym.size} bytes)`, 'sz') : '') +
@@ -2422,6 +2429,31 @@ function _escHtml(s) {
 // In-memory source store — persists until page refresh
 // { filename → ['', line1_text, line2_text, ...] }  (index 0 unused so indices = line numbers)
 const _srcStore = {};
+
+/**
+ * Look up a source file in _srcStore.
+ * Accepts either a bare filename ("BswSpi.c") or a full/relative path.
+ * Matching strategy (in order):
+ *   1. Exact key match
+ *   2. The store key ends with the basename of the query
+ *   3. The basename of the store key equals the basename of the query
+ * Returns the lines array or null.
+ */
+function _srcLookup(filenameOrPath) {
+    if (!filenameOrPath) return null;
+    const needle = _normPath(filenameOrPath).split('/').pop();  // bare basename
+
+    // 1. Exact match
+    if (_srcStore[filenameOrPath]) return _srcStore[filenameOrPath];
+    if (_srcStore[needle])         return _srcStore[needle];
+
+    // 2. Any stored key whose basename matches needle
+    for (const [k, v] of Object.entries(_srcStore)) {
+        const kBase = _normPath(k).split('/').pop();
+        if (kBase === needle) return v;
+    }
+    return null;
+}
 let   _srcScanResults = [];   // [{path, name, ext, dir, selected}]
 let   _srcRootPath = '';      // last used directory
 
@@ -2643,9 +2675,24 @@ function clearSourceFiles() {
     if (label) label.textContent = 'Drop .c/.h files here';
 }
 
+// Source bar state — persists across inspections
+let _srcBarMinimised = false;
+
 function closeSrcBar() {
+    _srcBarMinimised = true;
     const bar = document.getElementById('ai-src-bar');
     if (bar) bar.style.display = 'none';
+    // Show a small reopen button in the disassembly header
+    const reopenBtn = document.getElementById('ai-src-reopen');
+    if (reopenBtn) reopenBtn.style.display = '';
+}
+
+function openSrcBar() {
+    _srcBarMinimised = false;
+    const bar = document.getElementById('ai-src-bar');
+    if (bar) bar.style.display = '';
+    const reopenBtn = document.getElementById('ai-src-reopen');
+    if (reopenBtn) reopenBtn.style.display = 'none';
 }
 
 function setSrcStatus(msg) {
@@ -2686,101 +2733,115 @@ function updateSrcChips() {
  */
 function injectUserSourceIntoDisasm() {
     if (!_lastDisasmResult) return;
+
+    // Always work from the clean base — the original server response
+    // without any previously-injected source records.
+    // _lastDisasmResult._base stores this permanently.
     const d = _lastDisasmResult;
+    const base = d._base || d;   // _base is set below on first inject
 
-    // Identify the source filename we need
-    const srcFilename = d.source_file
-        ? _normPath(d.source_file).split('/').pop()
-        : '';
-
-    // Find it in the store — exact match or suffix match
-    const srcLines = srcFilename
-        ? (_srcStore[srcFilename]
-           || Object.entries(_srcStore).find(([k]) => k.endsWith(srcFilename))?.[1])
-        : null;
-
+    // ── 1. Find the source file ───────────────────────────────────────────
+    const srcLines = _srcLookup(base.source_file);
     if (!srcLines) {
-        if (srcFilename) setSrcStatus(`"${srcFilename}" not in loaded files`);
+        const fname = base.source_file
+            ? _normPath(base.source_file).split('/').pop()
+            : '(unknown)';
+        setSrcStatus(`"${fname}" not loaded — use Scan folder or drop the file`);
         return;
     }
 
-    const targetLine = d.source_line || d.target_source_line || 0;
+    // ── 2. Find the target line number ────────────────────────────────────
+    const targetLine = base.source_line || base.target_source_line || 0;
     if (!targetLine) {
-        setSrcStatus('No line number from addr2line');
+        setSrcStatus('No line number from addr2line — rebuild ELF with -g');
         return;
     }
 
-    // User-controlled context lines
-    const ctxN = parseInt(document.getElementById('ai-src-ctx')?.value || '5');
+    // ── 3. Determine context window ───────────────────────────────────────
+    const ctxN      = parseInt(document.getElementById('ai-src-ctx')?.value || '5');
     const startLine = ctxN === 0 ? 1 : Math.max(1, targetLine - ctxN);
     const endLine   = ctxN === 0
         ? srcLines.length - 1
         : Math.min(srcLines.length - 1, targetLine + ctxN);
 
-    // Build injection — insert source records just before the target instruction
-    // and a source_loc header before the block
+    const fname = _normPath(base.source_file || '').split('/').pop();
+
+    // ── 4. Build the injected record list ─────────────────────────────────
+    // Start from base.instructions (the clean server response).
+    // Find the target instruction by address (reliable across re-injects).
+    const targetAddr = base.target_addr_aligned;
+    const baseInsns  = base.instructions;
+
+    // Find the target instruction index in the BASE list
+    const baseTargetIdx = base.target_idx >= 0 ? base.target_idx
+        : baseInsns.findIndex(r => r.type === 'insn' && r.addr === targetAddr);
+
+    if (baseTargetIdx < 0) {
+        setSrcStatus('Could not locate target instruction');
+        return;
+    }
+
     const injected = [];
-    let injected_flag = false;
+    let sourceInserted = false;
 
-    // First pass: strip any previously injected source records
-    // (so re-running with different ctxN doesn't stack)
-    const base = (d._base_instructions || d.instructions).filter(r =>
-        r.type !== 'source_code' || r._injected !== true
-    );
+    for (let i = 0; i < baseInsns.length; i++) {
+        const rec = baseInsns[i];
 
-    base.forEach((rec, i) => {
-        if (!injected_flag && rec.type === 'insn' && i === (d._base_target_idx ?? d.target_idx)) {
+        // Insert source block BEFORE the target instruction
+        if (!sourceInserted && rec.type === 'insn' && i === baseTargetIdx) {
             injected.push({
                 type: 'source_loc',
-                file: srcFilename,
+                file: fname,
                 line: startLine,
-                text: srcFilename + ':' + startLine,
+                text: fname + ':' + startLine,
+                _injected: true,
             });
             for (let ln = startLine; ln <= endLine; ln++) {
                 injected.push({
                     type:      'source_code',
                     text:      srcLines[ln] || '',
                     _src_line: ln,
-                    _injected: true,   // marks user-injected records for cleanup
+                    _injected: true,
                 });
             }
-            injected_flag = true;
+            sourceInserted = true;
         }
         injected.push(rec);
-    });
+    }
 
-    // Recompute context window for the injected list
+    // ── 5. Find new target index in the injected list ─────────────────────
     const newTargetIdx = injected.findIndex(
-        (r, i) => r === d.instructions[d.target_idx] || (r.type === 'insn' && r.addr === d.target_addr_aligned)
+        r => r.type === 'insn' && r.addr === targetAddr
     );
 
+    // ── 6. Compute context window around the new target ───────────────────
+    const disasmCtx   = parseInt(document.getElementById('ai-ctx-lines')?.value || '10');
+    const insnIdxs    = injected.map((r, i) => r.type === 'insn' ? i : -1).filter(i => i >= 0);
+    let ctxStart = 0, ctxEnd = injected.length - 1;
+    if (insnIdxs.length && newTargetIdx >= 0) {
+        const rank   = insnIdxs.findIndex(idx => idx >= newTargetIdx);
+        const safeR  = rank >= 0 ? rank : insnIdxs.length - 1;
+        ctxStart = insnIdxs[Math.max(0, safeR - disasmCtx)];
+        ctxEnd   = insnIdxs[Math.min(insnIdxs.length - 1, safeR + disasmCtx)];
+        // Expand backward to include the injected source records just above target
+        while (ctxStart > 0 && injected[ctxStart - 1]?.type !== 'insn') ctxStart--;
+    }
+
+    // ── 7. Update and render ──────────────────────────────────────────────
     const newResult = {
-        ...d,
+        ...base,                        // start from clean base
         instructions:       injected,
-        target_idx:         newTargetIdx >= 0 ? newTargetIdx : d.target_idx,
+        target_idx:         newTargetIdx >= 0 ? newTargetIdx : baseTargetIdx,
         target_source_line: targetLine,
         has_source:         true,
-        _base_instructions: base,                          // keep for re-inject
-        _base_target_idx:   d._base_target_idx ?? d.target_idx,
+        context_start:      ctxStart,
+        context_end:        ctxEnd,
+        _base:              base._base || base,  // never overwrite the true base
     };
-
-    // Recompute context start/end for the injected instruction list
-    const insn_idxs = injected.map((r,i) => r.type === 'insn' ? i : -1).filter(i => i >= 0);
-    if (insn_idxs.length && newTargetIdx >= 0) {
-        const rank  = insn_idxs.findIndex(i => i >= newTargetIdx);
-        const safeR = rank >= 0 ? rank : insn_idxs.length - 1;
-        const lo = insn_idxs[Math.max(0, safeR - parseInt(document.getElementById('ai-ctx-lines')?.value || '10'))];
-        const hi = insn_idxs[Math.min(insn_idxs.length - 1, safeR + parseInt(document.getElementById('ai-ctx-lines')?.value || '10'))];
-        newResult.context_start = lo;
-        newResult.context_end   = hi;
-    }
 
     _lastDisasmResult = newResult;
     renderDisassembly(newResult, _disasmShowFull);
-
-    const bar = document.getElementById('ai-src-bar');
-    if (bar) bar.style.display = 'none';
-    setSrcStatus('');
+    setSrcStatus('✓ ' + fname + ':' + targetLine + ' — ' + (endLine - startLine + 1) + ' lines shown');
 }
 
 // ── Source bar visibility ─────────────────────────────────────────────────────
@@ -2790,40 +2851,44 @@ function injectUserSourceIntoDisasm() {
  * Always shown if files are already in the store (persist across inspections).
  */
 function updateSourceBar(d) {
-    const bar = document.getElementById('ai-src-bar');
+    const bar    = document.getElementById('ai-src-bar');
     if (!bar) return;
 
-    const hasStore = Object.keys(_srcStore).length > 0;
+    const hasStore    = Object.keys(_srcStore).length > 0;
+    const needsSource = !d.has_source && !!d.source_file;
+    const reopenBtn   = document.getElementById('ai-src-reopen');
 
-    if (!d.has_source && d.source_file) {
-        // Source known but didn't resolve — show the panel
-        bar.style.display = '';
-
-        // Pre-fill path hint from the ELF-embedded source path
-        const pathEl = document.getElementById('ai-src-dir');
-        if (pathEl && !pathEl.value) {
-            const parts = _normPath(d.source_file).split('/');
-            const hint  = parts.slice(0, -2).join('/');
-            if (hint) pathEl.placeholder = `e.g. ${hint}`;
-        }
-
-        // If we already have the file in store, inject immediately
-        if (hasStore) {
-            injectUserSourceIntoDisasm();
-        }
-    } else if (hasStore) {
-        // Source resolved via objdump, but still show bar so user can manage files
-        bar.style.display = 'none';
-        // Still try injection in case store has better coverage
-        if (!d.has_source) injectUserSourceIntoDisasm();
-    } else {
-        bar.style.display = 'none';
-    }
-
-    // Restore session-stored path
+    // Restore session-stored directory path
     const saved = sessionStorage.getItem('lmv_src_dir');
     const pathEl = document.getElementById('ai-src-dir');
     if (pathEl && saved && !pathEl.value) pathEl.value = saved;
+
+    // Pre-fill path hint from ELF DWARF data
+    if (pathEl && !pathEl.value && d.source_file) {
+        const parts = _normPath(d.source_file).split('/');
+        const hint  = parts.slice(0, -2).join('/');
+        if (hint) pathEl.placeholder = `e.g. ${hint}`;
+    }
+
+    // ISSUE 1 FIX: Never auto-hide the bar once it's been shown.
+    // Only hide if user explicitly clicked ✕ (_srcBarMinimised).
+    // Always show if source is needed AND user hasn't minimised.
+    if (needsSource && !_srcBarMinimised) {
+        bar.style.display = '';
+        if (reopenBtn) reopenBtn.style.display = 'none';
+    } else if (hasStore && !_srcBarMinimised) {
+        // Store has files — keep bar visible so user can manage them
+        bar.style.display = '';
+        if (reopenBtn) reopenBtn.style.display = 'none';
+    } else if (_srcBarMinimised) {
+        bar.style.display = 'none';
+        if (reopenBtn) reopenBtn.style.display = '';
+    }
+
+    // ISSUE 2 FIX: If we have source in store for this symbol, inject immediately
+    if (hasStore) {
+        injectUserSourceIntoDisasm();
+    }
 
     updateSrcChips();
 }
@@ -3079,3 +3144,260 @@ fetchDisassembly = async function(addrInt, symResult, sourceDir) {
             `<div style="padding:14px;color:var(--red)">❌ Request failed: ${_escHtml(e.message)}</div>`;
     }
 };
+// =============================================================================
+// ISSUE 4 & 5 — CRASH POINT POPUP + SOURCE/DISASSEMBLY POPUPS
+// =============================================================================
+//
+// Issue 4: Clicking the highlighted (target) instruction row opens a popup
+//   showing the disassembly context + available source lines side-by-side.
+//   The popup can be screenshotted for bug reports.
+//
+// Issue 5: Clicking the source file path in "Source line  addr2line" card
+//   opens the source file centred on the crash line (if file is in store).
+//   Clicking the symbol name in the "Symbol" card opens full disassembly
+//   (or source if available) with the crash address highlighted.
+// =============================================================================
+
+/**
+ * Open a popup showing disassembly + source around the crash address.
+ * Called when user clicks the highlighted ► instruction row.
+ *
+ * @param {object} d           The _lastDisasmResult
+ * @param {number} targetIdx   Index of the target instruction
+ */
+function openCrashPopup(d, targetIdx) {
+    if (!d) return;
+
+    const target = d.instructions[targetIdx];
+    if (!target) return;
+
+    const crashAddr = '0x' + (target.addr||0).toString(16).toUpperCase().padStart(8,'0');
+    const fa        = d.fault_analysis;
+    const srcFile   = d.source_file || '';
+    const srcLine   = d.source_line || d.target_source_line || 0;
+
+    // ── Build disassembly snippet HTML ──────────────────────────────────
+    // Show N lines around the target from instructions
+    const insns = d.instructions.filter(r => r.type === 'insn');
+    const tRank = insns.findIndex(r => r.addr === target.addr);
+    const window = 6;
+    const visible = insns.slice(Math.max(0, tRank - window),
+                                Math.min(insns.length, tRank + window + 1));
+
+    const disasmHtml = visible.map(ins => {
+        const isT  = ins.addr === target.addr;
+        const mc   = ins.is_load ? 'is-load' : ins.is_store ? 'is-store'
+                   : ins.is_branch ? 'is-branch' : '';
+        const addr = '0x' + ins.addr.toString(16).toUpperCase().padStart(8,'0');
+        return `<div class="disasm-line${isT ? ' target' : ''}" style="padding:2px 0">
+            <span class="dc-addr">${addr}</span>
+            <span class="dc-bytes" style="width:90px">${_escHtml(ins.raw_bytes)}</span>
+            <span class="dc-mnem ${mc}">${_escHtml(ins.mnemonic)}</span>
+            <span class="dc-ops">${_escHtml(ins.operands)}</span>
+        </div>`;
+    }).join('');
+
+    // ── Build source snippet HTML ────────────────────────────────────────
+    let sourceHtml = '';
+    if (srcLine && srcFile) {
+        const fname   = srcFile.split('/').pop().split('\\').pop();
+        const srcLines = Object.entries(_srcStore).find(([k]) => k === fname || fname.endsWith(k))?.[1];
+        if (srcLines) {
+            const ctx   = 6;
+            const start = Math.max(1, srcLine - ctx);
+            const end   = Math.min(srcLines.length - 1, srcLine + ctx);
+            const lines = [];
+            for (let ln = start; ln <= end; ln++) {
+                const isTarget = ln === srcLine;
+                lines.push(
+                    `<div style="display:flex;gap:8px;padding:1px 0;` +
+                    `${isTarget ? 'background:#200d0d;border-left:3px solid var(--red);padding-left:4px' : ''}">` +
+                    `<span style="color:#555d66;min-width:32px;text-align:right;` +
+                    `${isTarget ? 'color:var(--red);font-weight:600' : ''}">${ln}</span>` +
+                    `<span style="color:${isTarget ? '#ff9999' : '#6e7681'};white-space:pre">` +
+                    `${_escHtml(srcLines[ln] || '')}</span></div>`
+                );
+            }
+            sourceHtml = `
+                <div style="font-size:11px;color:var(--dim);margin-bottom:4px">
+                    📄 ${_escHtml(fname)} — crash at line ${srcLine}
+                </div>
+                <div style="font:11px var(--mono);background:var(--bg);
+                    border:1px solid var(--bdr);border-radius:4px;padding:8px;
+                    overflow-y:auto;max-height:260px">${lines.join('')}</div>`;
+        }
+    }
+
+    // ── Fault analysis summary ───────────────────────────────────────────
+    const faHtml = fa ? `
+        <div style="margin-bottom:12px">
+            <div class="fault-banner ${fa.confidence}" style="border-radius:4px">
+                <div class="fault-icon" style="font-size:18px">${fa.icon}</div>
+                <div>
+                    <div class="fault-title">${_escHtml(fa.title)}</div>
+                    <div class="fault-conf ${fa.confidence}">${fa.confidence.toUpperCase()}</div>
+                    <div class="fault-desc" style="font-size:10px">${_escHtml(fa.description)}</div>
+                    <div class="fault-fix" style="font-size:10px">💡 ${_escHtml(fa.fix)}</div>
+                </div>
+            </div>
+        </div>` : '';
+
+    // ── Export to text ───────────────────────────────────────────────────
+    const textContent = [
+        `Crash at: ${crashAddr}`,
+        `Function: ${d.func_name || ''}`,
+        srcFile && srcLine ? `Source:   ${srcFile}:${srcLine}` : '',
+        fa ? `\nFault analysis: ${fa.title} (${fa.confidence} confidence)\n${fa.detail}\n${fa.fix}` : '',
+        '\nDisassembly:',
+        visible.map(ins => {
+            const addr = '0x' + ins.addr.toString(16).toUpperCase().padStart(8,'0');
+            const mark = ins.addr === target.addr ? '►' : ' ';
+            return `  ${mark} ${addr}  ${ins.raw_bytes.padEnd(16)}  ${ins.mnemonic.padEnd(8)} ${ins.operands}`;
+        }).join('\n'),
+    ].filter(Boolean).join('\n');
+
+    const b64text = btoa(unescape(encodeURIComponent(textContent)));
+
+    const body = `
+        <div style="padding:16px 20px">
+            ${faHtml}
+            <div style="display:flex;gap:12px;flex-wrap:wrap">
+                <!-- Disassembly column -->
+                <div style="flex:1;min-width:280px">
+                    <div style="font-size:11px;color:var(--dim);margin-bottom:4px">
+                        💻 Disassembly — crash at ${crashAddr}
+                    </div>
+                    <div style="font:11px var(--mono);background:var(--bg);
+                        border:1px solid var(--bdr);border-radius:4px;padding:8px;
+                        overflow-y:auto;max-height:260px">${disasmHtml}</div>
+                </div>
+                <!-- Source column -->
+                ${sourceHtml ? `<div style="flex:1;min-width:280px">${sourceHtml}</div>` : ''}
+            </div>
+            <div style="margin-top:12px;display:flex;gap:8px">
+                <button class="hbtn"
+                    onclick="navigator.clipboard.writeText(decodeURIComponent(escape(atob('${b64text}'))))
+                        .then(()=>this.textContent='✓ Copied!').catch(()=>{})">
+                    📋 Copy as text
+                </button>
+                <span style="font-size:10px;color:var(--dim);align-self:center">
+                    Use browser Ctrl+Shift+S or Print → Save as PDF to snapshot this popup
+                </span>
+            </div>
+        </div>`;
+
+    openModal('💥', `Crash at ${crashAddr}`,
+        `${d.func_name || ''} · ${srcFile ? srcFile.split('/').pop() : 'no source'} ${srcLine ? ':'+srcLine : ''}`,
+        [], [body]);
+}
+
+/**
+ * Issue 4b: Open source file popup centred on a given line.
+ * Called when user clicks the file path in the addr2line card.
+ */
+function openSourcePopup(filename, targetLine) {
+    if (!filename) return;
+    const fname = filename.split('/').pop().split('\\').pop();
+    const srcLines = _srcLookup(filename);
+
+    if (!srcLines) {
+        // Source not in store — show the source bar for loading
+        openSrcBar();
+        setSrcStatus(`Drop "${fname}" or scan its folder`);
+        return;
+    }
+
+    // srcLines from _srcLookup
+    const ctx   = 20;
+    const start = targetLine ? Math.max(1, targetLine - ctx) : 1;
+    const end   = targetLine ? Math.min(srcLines.length - 1, targetLine + ctx) : srcLines.length - 1;
+
+    const lines = [];
+    for (let ln = start; ln <= end; ln++) {
+        const isT = ln === targetLine;
+        lines.push(
+            `<div style="display:flex;gap:10px;padding:1px 0;` +
+            (isT ? 'background:#200d0d;border-left:3px solid var(--red);' : '') + `">` +
+            `<span style="color:${isT?'var(--red)':'#555d66'};min-width:36px;` +
+            `text-align:right;font-weight:${isT?'700':'400'}">${ln}</span>` +
+            `<span style="color:${isT?'#ff9999':'#8b949e'};white-space:pre;overflow-x:auto">` +
+            `${_escHtml(srcLines[ln]||'')}</span></div>`
+        );
+    }
+
+    const body = `
+        <div style="padding:16px 20px">
+            <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+                ${targetLine ? `Crash at line <strong style="color:var(--red)">${targetLine}</strong> —` : ''}
+                showing ${start}–${end} of ${srcLines.length-1} lines
+            </div>
+            <div style="font:11px var(--mono);background:var(--bg);border:1px solid var(--bdr);
+                border-radius:4px;padding:8px;max-height:70vh;overflow-y:auto" id="src-popup-body">
+                ${lines.join('')}
+            </div>
+        </div>`;
+
+    openModal('📄', fname,
+        targetLine ? `Line ${targetLine} highlighted` : 'Full file',
+        [], [body]);
+
+    // Auto-scroll to highlighted line
+    requestAnimationFrame(() => {
+        const el = document.querySelector('#src-popup-body [style*="background:#200d0d"]');
+        if (el) el.scrollIntoView({ block: 'center' });
+    });
+}
+
+/**
+ * Issue 5: Open a popup from the Symbol card showing full function disassembly
+ * or source (if available), with the crash address highlighted.
+ * Called by clicking the symbol name in the ELF symbol card.
+ */
+function openSymbolDisasmPopup() {
+    if (!_lastDisasmResult) return;
+    const d = _lastDisasmResult;
+
+    // Try source first if available
+    const srcFile  = d.source_file || '';
+    const srcLine  = d.source_line || d.target_source_line || 0;
+    const srcLines_sym = srcFile ? _srcLookup(srcFile) : null;
+
+    if (srcLines_sym) {
+        // Show full function source with crash line highlighted
+        openSourcePopup(srcFile, srcLine);
+    } else {
+        // Show full function disassembly with target highlighted
+        const insns = d.instructions.filter(r => r.type === 'insn');
+        const target = d.instructions[d.target_idx];
+        const targetAddr = target?.addr;
+
+        const html = insns.map(ins => {
+            const isT = ins.addr === targetAddr;
+            const mc  = ins.is_load ? 'is-load' : ins.is_store ? 'is-store'
+                      : ins.is_branch ? 'is-branch' : '';
+            const addr = '0x' + ins.addr.toString(16).toUpperCase().padStart(8,'0');
+            return `<div class="disasm-line${isT ? ' target' : ''}">
+                <span class="dc-addr">${addr}</span>
+                <span class="dc-bytes">${_escHtml(ins.raw_bytes)}</span>
+                <span class="dc-mnem ${mc}">${_escHtml(ins.mnemonic)}</span>
+                <span class="dc-ops">${_escHtml(ins.operands)}</span>
+            </div>`;
+        }).join('');
+
+        const body = `
+            <div style="padding:12px 20px">
+                <div style="font:12px var(--mono);background:var(--bg);border:1px solid var(--bdr);
+                    border-radius:4px;padding:8px;max-height:70vh;overflow-y:auto"
+                    id="sym-disasm-body">${html}</div>
+            </div>`;
+
+        openModal('💻', d.func_name || 'Function disassembly',
+            `${insns.length} instructions · crash address highlighted`,
+            [], [body]);
+
+        requestAnimationFrame(() => {
+            const el = document.querySelector('#sym-disasm-body .target');
+            if (el) el.scrollIntoView({ block: 'center' });
+        });
+    }
+}

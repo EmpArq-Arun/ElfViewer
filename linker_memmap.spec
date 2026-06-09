@@ -1,21 +1,33 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # PyInstaller spec for Linker MemMap Viewer
+# Build:  pyinstaller linker_memmap.spec  (from inside the lmv/ directory)
+# Output: dist/LinkerMemMap.exe
 #
-# Build command (run from the lmv/ directory):
-#   pyinstaller linker_memmap.spec
+# ISSUE 6 — libdep.so / 0xc000012f error:
+#   This error occurs when PyInstaller bundles shared libraries that Windows
+#   cannot load (typically Linux .so files accidentally included).
+#   Fixes applied:
+#     - Explicit excludes list strips unused heavy packages
+#     - collect_data_files / collect_dynamic_libs not used (no heavy deps)
+#     - UPX compression disabled — UPX can corrupt some PE headers on Win32
 #
-# Output:
-#   dist/LinkerMemMap.exe   ← single file, no install needed
+# ISSUE 7 — No terminal window in background:
+#   console=False  →  no black CMD window appears alongside the browser
+#   The server runs as a hidden background process.
+#   The browser page sends POST /shutdown to stop it cleanly.
+#   A system tray icon is NOT added (requires additional dependencies) but
+#   the browser page has a "Stop server" button that calls /shutdown.
 
 import os
+import sys
 
-# Collect all static assets (CSS, JS, HTML) that must be bundled
-# PyInstaller copies these into a temp folder at runtime
+# Collect all static assets that must be bundled with the exe
 datas = [
-    ('static',    'static'),     # static/app.css, static/*.js
-    ('templates', 'templates'),  # templates/index.html
-    ('README.md', '.'),          # optional, nice to have
+    ('static',    'static'),      # CSS + JS
+    ('templates', 'templates'),   # index.html
+    ('parsers',   'parsers'),     # Python parser modules
+    ('README.md', '.'),
 ]
 
 a = Analysis(
@@ -24,8 +36,12 @@ a = Analysis(
     binaries=[],
     datas=datas,
     hiddenimports=[
-        # bottle uses these at runtime but PyInstaller may miss them
         'bottle',
+        'parsers.ld_parser',
+        'parsers.elf_parser',
+        'parsers.map_parser',
+        'parsers.callgraph_parser',
+        'parsers.disasm_parser',
         'email.mime.text',
         'email.mime.multipart',
     ],
@@ -33,15 +49,35 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Things we definitely don't need — shrinks the exe
-        'matplotlib', 'numpy', 'pandas', 'scipy', 'PIL',
-        'tkinter', 'wx', 'gtk',
-        'IPython', 'jupyter',
-        'test', 'unittest',
+        # Strip everything we don't need — reduces size and avoids
+        # bundling Linux shared libs that cause the 0xc000012f error
+        'matplotlib', 'numpy', 'pandas', 'scipy', 'PIL', 'Pillow',
+        'tkinter', 'wx', 'gtk', 'gi',
+        'IPython', 'jupyter', 'notebook',
+        'test', 'unittest', 'doctest',
+        'pydoc', 'xml.etree',
+        'cryptography', 'OpenSSL', 'ssl',
+        'sqlite3',
+        '_pytest', 'pytest',
+        'setuptools', 'pkg_resources',
+        'distutils',
+        'email.mime.image',    # keep text + multipart, drop image
+        'http.server',         # we use bottle, not stdlib server
+        'xmlrpc',
     ],
     noarchive=False,
     optimize=1,
 )
+
+# Filter out any .so files that aren't for Windows — these cause 0xc000012f
+# (They can appear when building on WSL or if Python was built on Linux)
+def is_windows_binary(src, dst):
+    if src.endswith('.so') or '.so.' in src:
+        return False   # skip Linux shared libs
+    return True
+
+a.binaries = [(dst, src, typ) for (dst, src, typ) in a.binaries
+              if is_windows_binary(src, dst)]
 
 pyz = PYZ(a.pure)
 
@@ -55,14 +91,15 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,           # compress with UPX if available (reduces size ~30%)
+    upx=False,          # ISSUE 6 FIX: UPX disabled — can corrupt PE headers
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,       # keep console so you see the port number and errors
+    console=False,      # ISSUE 7 FIX: no console window — server runs silently
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='icon.ico',  # uncomment and add an .ico file to brand it
+    # Uncomment to add a custom icon:
+    # icon='icon.ico',
 )
