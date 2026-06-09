@@ -47,10 +47,11 @@ def resolve_tools(raw):
         return c
 
     return {
-        'nm':   find_tool(candidates('nm',   'nm')),
-        're':   find_tool(candidates('re',   'readelf')),
-        'size': find_tool(candidates('size', 'size')),
-        'a2l':  find_tool(candidates('a2l',  'addr2line')),
+        'nm':      find_tool(candidates('nm',      'nm')),
+        're':      find_tool(candidates('re',      'readelf')),
+        'size':    find_tool(candidates('size',    'size')),
+        'a2l':     find_tool(candidates('a2l',     'addr2line')),
+        'objdump': find_tool(candidates('objdump', 'objdump')),
         'prefix_in':  raw.get('prefix', ''),
         'prefix_out': prefix,
     }

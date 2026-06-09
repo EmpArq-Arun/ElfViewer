@@ -428,6 +428,168 @@
 
           </div><!-- /ai-results -->
 
+          <!-- Disassembly panel — shown after inspect when ELF is available -->
+          <div id="ai-disasm-panel" style="display:none;margin-top:12px">
+            <div class="card-wrap">
+              <div class="tbl-hdr">
+                💻 Disassembly
+                <span class="sub" id="ai-disasm-func"></span>
+                <div class="tbl-actions" style="gap:6px;align-items:center;flex-wrap:wrap">
+                  <label style="font-size:11px;color:var(--dim)">Context:</label>
+                  <select id="ai-ctx-lines" class="fsel" style="width:60px"
+                    onchange="rerunDisasm()">
+                    <option value="5">5</option>
+                    <option value="10" selected>10</option>
+                    <option value="20">20</option>
+                    <option value="50">50</option>
+                    <option value="0">All</option>
+                  </select>
+                  <button class="hbtn" onclick="toggleDisasmFull()">
+                    <span id="ai-disasm-toggle-lbl">Full fn</span>
+                  </button>
+                  <button class="hbtn" onclick="showRawObjdump()">Raw</button>
+                  <button class="hbtn" onclick="copyDisasm()">📋 Copy</button>
+                </div>
+              </div>
+              <!-- Source directory picker — shown when source lines are missing -->
+              <!-- Source panel — shown when source lines are missing or for manual loading -->
+              <div id="ai-src-bar" style="display:none;border-bottom:1px solid var(--bdr)">
+                <!-- Header row -->
+                <div style="padding:8px 14px;background:#100c05;border-bottom:1px solid #5a3d1a;
+                  display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span style="font-size:11px;color:var(--ora)">⚠ Source lines not found</span>
+                  <span style="font-size:11px;color:var(--dim)">— provide your source root directory:</span>
+                  <div class="tbl-actions" style="margin-left:auto">
+                    <button class="hbtn" onclick="closeSrcBar()">✕</button>
+                  </div>
+                </div>
+                <!-- Path input row -->
+                <div style="padding:8px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                  <input id="ai-src-dir" class="search" style="flex:1;min-width:240px;font-size:11px"
+                    placeholder="e.g. C:\S32DS_workspace\S32K312_FreeRTOS\src"
+                    onkeydown="if(event.key==='Enter')scanSourceDir()">
+                  <button class="hbtn" onclick="scanSourceDir()">🔍 Scan folder</button>
+                  <span style="font-size:11px;color:var(--dim)">or drop files:</span>
+                  <input type="file" id="ai-src-file-picker"
+                    accept=".c,.cpp,.cxx,.cc,.h,.hpp,.s,.asm"
+                    style="display:none" multiple onchange="onSourceFilePick(this.files)">
+                  <div class="drop-area" id="ai-src-drop" style="min-height:36px;padding:6px 12px;
+                    font-size:11px;display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+                    <span>📂</span><span id="ai-src-drop-label">Drop .c/.h files here</span>
+                  </div>
+                  <span id="ai-src-status" style="font-size:11px;color:var(--dim)"></span>
+                </div>
+                <!-- Loaded files summary -->
+                <div id="ai-src-loaded" style="display:none;padding:4px 14px 8px;
+                  display:flex;flex-wrap:wrap;gap:4px;align-items:center">
+                  <span style="font-size:10px;color:var(--dim)">Loaded:</span>
+                  <div id="ai-src-chips" style="display:flex;flex-wrap:wrap;gap:3px"></div>
+                  <button class="hbtn" style="font-size:10px"
+                    onclick="clearSourceFiles()">Clear all</button>
+                </div>
+                <!-- File picker (same pattern as .su/.ci picker) -->
+                <div id="ai-src-picker" style="display:none;padding:10px 14px;
+                  border-top:1px solid var(--bdr)">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                    <span style="font-size:12px;color:#fff" id="ai-src-picker-title"></span>
+                    <div style="display:flex;gap:6px">
+                      <button class="hbtn" onclick="srcPickerAll()">Select all</button>
+                      <button class="hbtn" onclick="srcPickerNone()">None</button>
+                      <button class="hbtn" onclick="srcPickerExt('.c')">Only .c</button>
+                      <button class="hbtn" onclick="srcPickerExt('.h')">Only .h</button>
+                      <button class="run-btn" style="width:auto;padding:5px 14px;margin:0"
+                        onclick="loadSelectedSource()">▶ Load selected</button>
+                    </div>
+                  </div>
+                  <div id="ai-src-picker-list"
+                    style="max-height:200px;overflow-y:auto;background:var(--bg);
+                           border:1px solid var(--bdr);border-radius:var(--rad);padding:6px">
+                  </div>
+                </div>
+                <!-- Source context lines control -->
+                <div style="padding:6px 14px;border-top:1px solid var(--bdr);
+                  display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                  <label style="font-size:11px;color:var(--dim)">Source context lines around crash:</label>
+                  <select id="ai-src-ctx" class="fsel" style="width:70px"
+                    onchange="injectUserSourceIntoDisasm()">
+                    <option value="3">3</option>
+                    <option value="5" selected>5</option>
+                    <option value="10">10</option>
+                    <option value="20">20</option>
+                    <option value="50">50</option>
+                    <option value="0">All</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--dim)">lines before/after crash line</span>
+                </div>
+              </div>
+              <!-- Register context panel — optional CPU registers to improve fault analysis -->
+              <div id="ai-reg-panel" style="display:none;padding:8px 14px;
+                background:#080f10;border-bottom:1px solid var(--bdr)">
+                <div style="font-size:11px;color:var(--dim);margin-bottom:6px">
+                  Optional: paste CPU registers from your fault handler for deeper analysis
+                  <button class="hbtn" style="margin-left:8px;font-size:10px"
+                    onclick="toggleRegPanel()">Hide</button>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <label style="font-size:10px;color:var(--dim);width:32px">PC</label>
+                    <input class="search" id="reg-pc" placeholder="0x00401234"
+                      style="width:110px;font-size:11px" oninput="updateRegAnalysis()">
+                  </div>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <label style="font-size:10px;color:var(--dim);width:32px">LR</label>
+                    <input class="search" id="reg-lr" placeholder="0xFFFFFFF9"
+                      style="width:110px;font-size:11px" oninput="updateRegAnalysis()">
+                  </div>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <label style="font-size:10px;color:var(--dim);width:32px">SP</label>
+                    <input class="search" id="reg-sp" placeholder="0x20007E00"
+                      style="width:110px;font-size:11px" oninput="updateRegAnalysis()">
+                  </div>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <label style="font-size:10px;color:var(--dim);width:32px">BFAR</label>
+                    <input class="search" id="reg-bfar" placeholder="0x00000000"
+                      style="width:110px;font-size:11px" oninput="updateRegAnalysis()">
+                  </div>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <label style="font-size:10px;color:var(--dim);width:32px">CFSR</label>
+                    <input class="search" id="reg-cfsr" placeholder="0x00000200"
+                      style="width:110px;font-size:11px" oninput="updateRegAnalysis()">
+                  </div>
+                </div>
+                <div id="reg-analysis-out" style="margin-top:8px;font-size:11px;
+                  color:#8b949e;line-height:1.6"></div>
+              </div>
+
+              <!-- Fault analysis banner — shown when a pattern is detected -->
+              <div id="ai-fault-banner" style="display:none;padding:12px 16px;
+                border-bottom:1px solid var(--bdr)"></div>
+              <!-- Raw objdump output modal (hidden, shown on demand) -->
+              <div id="ai-raw-modal" style="display:none;position:absolute;inset:0;
+                z-index:100;background:var(--bg);overflow:auto;padding:12px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+                  <span style="font-size:12px;color:var(--acc)">Raw objdump output</span>
+                  <button class="hbtn" onclick="$('ai-raw-modal').style.display='none'">✕ Close</button>
+                </div>
+                <pre id="ai-raw-out" style="font-size:11px;color:#8b949e;white-space:pre;
+                  overflow-x:auto"></pre>
+              </div>
+              <!-- Disassembly listing -->
+              <div id="ai-disasm-body"
+                style="font:12px var(--mono);padding:0;overflow-x:auto;
+                       max-height:60vh;overflow-y:auto;background:var(--bg);
+                       position:relative">
+                <div style="padding:14px;color:var(--dim)">
+                  Click Inspect with an ELF loaded to see disassembly.
+                </div>
+              </div>
+              <!-- Source file info -->
+              <div id="ai-disasm-footer"
+                style="padding:8px 14px;font-size:11px;color:var(--dim);
+                       border-top:1px solid var(--bdr);display:none"></div>
+            </div>
+          </div>
+
           <!-- History -->
           <div class="card-wrap" style="margin-top:14px">
             <div class="tbl-hdr">
@@ -629,6 +791,7 @@ document.addEventListener('DOMContentLoaded', function() {
     buildFeaturesPanel();
     initDropZones();
     initStackDrop();
+    initSourceDrop();   // source file drop zone in disassembly panel
     console.log('[boot] Linker MemMap ready');
 });
 </script>

@@ -38,6 +38,7 @@ BaseRequest.MEMFILE_MAX = 10 * 1024 * 1024  # 10 MB for text form fields
 from parsers.ld_parser  import parse_linker_script
 from parsers.map_parser import parse_map
 from parsers.callgraph_parser import analyse_callgraph
+from parsers.disasm_parser   import disassemble
 from parsers.elf_parser import (
     resolve_tools, save_elf, analyse_elf,
     assign_symbols, make_warnings, startup_cost, run_tool
@@ -406,6 +407,81 @@ def route_load_su_files():
 
 
 
+@app.route('/disassemble', method='POST')
+def route_disassemble():
+    """
+    Disassemble the function containing a given address.
+
+    Accepts:
+        addr           hex string  e.g. "0x00401234"
+        context_lines  int         lines before/after target (default 10)
+        func_start     hex string  optional — if caller knows from nm
+        func_end       hex string  optional
+        prefix         str         toolchain prefix
+        tools_json     JSON str    full tools dict (nm, re, size, a2l, objdump)
+
+    Returns:
+        Full disassembly result from disasm_parser.disassemble()
+
+    EMBEDDED ENGINEER NOTE:
+        The disassembly is most useful when the ELF was built with -g.
+        Without debug info, C source lines won't appear — but ARM Thumb-2
+        instruction analysis still works.
+    """
+    response.content_type = 'application/json'
+    tmp = None
+    try:
+        up = request.files.get('elf')
+        if not up:
+            return json.dumps({"error": "No ELF file — load ELF and click Analyse ELF first"})
+
+        addr_str = request.forms.get('addr', '').strip()
+        if not addr_str:
+            return json.dumps({"error": "No address provided"})
+
+        try:
+            target_addr = int(addr_str, 0)
+        except ValueError:
+            return json.dumps({"error": f"Invalid address: {addr_str}"})
+
+        context_lines = int(request.forms.get('context_lines', '10'))
+        context_lines = max(1, min(context_lines, 100))   # clamp 1–100
+
+        raw_tools = json.loads(request.forms.get('tools_json', '{}'))
+        tools     = resolve_tools(raw_tools)
+
+        # Optional known function bounds (avoids a second objdump pass)
+        func_start_str = request.forms.get('func_start', '').strip()
+        func_end_str   = request.forms.get('func_end',   '').strip()
+        func_start = int(func_start_str, 0) if func_start_str else None
+        func_end   = int(func_end_str,   0) if func_end_str   else None
+
+        tmp = save_elf(up)
+
+        source_dir = request.forms.get('source_dir', '').strip() or None
+        if source_dir:
+            source_dir = os.path.expandvars(os.path.expanduser(source_dir))
+
+        result = disassemble(
+            tmp_path      = tmp,
+            tools         = tools,
+            target_addr   = target_addr,
+            context_lines = context_lines,
+            func_start    = func_start,
+            func_end      = func_end,
+            source_dir    = source_dir,
+        )
+        return json.dumps(result)
+
+    except Exception as ex:
+        import traceback
+        return json.dumps({"error": str(ex), "trace": traceback.format_exc()})
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.unlink(tmp)
+            except Exception: pass
+
+
 @app.route('/debug_ci', method='POST')
 def route_debug_ci():
     """
@@ -470,6 +546,102 @@ def route_analyse_callgraph():
     except Exception as ex:
         import traceback
         return json.dumps({"error": str(ex), "trace": traceback.format_exc()})
+
+
+@app.route('/scan_source', method='POST')
+def route_scan_source():
+    """
+    Walk a directory tree and return all source files found.
+
+    Searches recursively for: .c .cpp .cxx .cc .h .hpp .s .asm .inc
+    Returns list of {path, name, ext, dir, size} sorted shallowest-first.
+
+    The browser cannot access the filesystem directly — this route lets the
+    user type a path and see what source files the server finds, then pick
+    which ones to load (same pattern as /scan_su for .su/.ci files).
+    """
+    response.content_type = 'application/json'
+    try:
+        path = (request.forms.get('path', '') or '').strip()
+        if not path:
+            return json.dumps({"error": "No path provided"})
+
+        path = os.path.expandvars(os.path.expanduser(path))
+        if not os.path.isdir(path):
+            return json.dumps({"error": f"Directory not found: {path}"})
+
+        SOURCE_EXTS = {'.c', '.cpp', '.cxx', '.cc', '.h', '.hpp',
+                       '.s', '.asm', '.inc', '.c++', '.hxx', '.h++'}
+
+        files = []
+        for root, dirs, fnames in os.walk(path):
+            # Skip common non-source directories
+            dirs[:] = sorted(d for d in dirs
+                             if not d.startswith('.')
+                             and d not in ('node_modules', '.git', '.svn',
+                                           '__pycache__', 'Debug', 'Release',
+                                           'build', 'dist', '.vs', 'obj'))
+            rel = os.path.relpath(root, path)
+            rel = '' if rel == '.' else rel
+            for fname in sorted(fnames):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in SOURCE_EXTS:
+                    full = os.path.join(root, fname)
+                    files.append({
+                        "path": full,
+                        "name": fname,
+                        "ext":  ext,
+                        "dir":  rel or '(root)',
+                        "size": os.path.getsize(full),
+                    })
+
+        # Sort: shallowest first, then alphabetical
+        files.sort(key=lambda f: (f['dir'].count(os.sep), f['name']))
+
+        return json.dumps({"files": files, "total": len(files), "root": path})
+
+    except PermissionError as ex:
+        return json.dumps({"error": f"Permission denied: {ex.filename}"})
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
+
+
+@app.route('/load_source_files', method='POST')
+def route_load_source_files():
+    """
+    Read selected source files and return their contents.
+    Used when the user picks files from the /scan_source picker.
+    """
+    response.content_type = 'application/json'
+    try:
+        paths = json.loads(request.forms.get('paths', '[]'))
+        if not paths:
+            return json.dumps({"error": "No paths provided"})
+
+        files  = []
+        errors = []
+        SOURCE_EXTS = {'.c', '.cpp', '.cxx', '.cc', '.h', '.hpp',
+                       '.s', '.asm', '.inc', '.c++', '.hxx', '.h++'}
+
+        for path in paths:
+            path = os.path.expandvars(os.path.expanduser(path))
+            ext  = os.path.splitext(path)[1].lower()
+            if not os.path.isfile(path):
+                errors.append(f"Not found: {path}"); continue
+            if ext not in SOURCE_EXTS:
+                errors.append(f"Not a source file: {path}"); continue
+            try:
+                with open(path, 'r', errors='replace') as fh:
+                    content = fh.read()
+                files.append({"name": os.path.basename(path),
+                              "path": path, "content": content})
+            except Exception as e:
+                errors.append(f"{path}: {e}")
+
+        return json.dumps({"files": files, "errors": errors})
+
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
 
 
 

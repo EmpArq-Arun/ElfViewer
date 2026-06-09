@@ -363,6 +363,10 @@ async function inspectAddress() {
   if (symResult.sym) renderOffsetBar(addrInt, symResult.sym);
   else $('ai-offset-bar').style.display = 'none';
 
+  // ── Disassembly (async — runs objdump on the function) ──────────────
+  setStatus('Disassembling…', 95);
+  fetchDisassembly(addrInt, symResult);   // does not block — updates panel independently
+
   // ── History ───────────────────────────────────────────────────────────
   const entry = {
     addr:    hexAddr,
@@ -2016,3 +2020,1062 @@ function downloadChainSVG(btn) {
         setTimeout(() => btn.textContent = '⬇ Export SVG', 2000);
     }
 }
+
+// =============================================================================
+// DISASSEMBLY VIEW
+// =============================================================================
+//
+// Shows arm-none-eabi-objdump disassembly of the function containing the
+// inspected address, with:
+//   • The target instruction highlighted with ► and a blue left border
+//   • C source lines interleaved (if ELF was built with -g)
+//   • N lines of context around the target (user-adjustable)
+//   • Colour-coded mnemonics: green=load, orange=store, purple=branch
+//   • Fault analysis banner when a crash pattern is detected
+//
+// EMBEDDED ENGINEER NOTE ON COLOURS:
+//   Green  (LDR family)  — reading from memory.  If this faults, the READ
+//                          address is bad (NULL, wrong region, misaligned).
+//   Orange (STR family)  — writing to memory.  If this faults, the WRITE
+//                          address is bad (flash, MPU-protected, NULL).
+//   Purple (B/BL/BX)     — branch/call.  If this faults, a function pointer
+//                          is corrupt or the return address was smashed.
+//
+// SOFTWARE ENGINEER NOTE:
+//   objdump --source requires the ELF to have DWARF debug sections (.debug_info,
+//   .debug_line etc.).  These are present when compiling with -g or -g3.
+//   They don't affect code size — they're stripped by the bootloader/flasher.
+// =============================================================================
+
+// Cached last disassembly result — used by toggleDisasmFull / rerunDisasm
+let _lastDisasmResult   = null;
+let _lastDisasmAddr     = 0;
+let _disasmShowFull     = false;   // false = N-line context, true = full function
+
+/**
+ * Fetch and render disassembly for a given address.
+ * Called from inspectAddress() after the four-card results are shown.
+ *
+ * @param {number} addrInt     The target address (integer)
+ * @param {object} symResult   Result from inspectSymbol() — used for func bounds
+ */
+async function fetchDisassembly(addrInt, symResult) {
+    if (!S.elfFile) return;   // no ELF — silently skip
+
+    _lastDisasmAddr = addrInt;
+
+    const panel = $('ai-disasm-panel');
+    const body  = $('ai-disasm-body');
+    panel.style.display = '';
+    body.innerHTML = '<div style="padding:14px;color:var(--dim)">⏳ Disassembling…</div>';
+    $('ai-fault-banner').style.display = 'none';
+    $('ai-disasm-footer').style.display = 'none';
+
+    const tools = {
+        nm:      $('t-nm')?.value.trim()     || 'arm-none-eabi-nm',
+        re:      $('t-re')?.value.trim()     || 'arm-none-eabi-readelf',
+        size:    $('t-sz')?.value.trim()     || 'arm-none-eabi-size',
+        a2l:     $('t-a2l')?.value.trim()    || 'arm-none-eabi-addr2line',
+        objdump: 'arm-none-eabi-objdump',    // standard name — same prefix as nm
+        prefix:  $('t-prefix')?.value.trim() || '',
+    };
+
+    const ctxLines = parseInt($('ai-ctx-lines')?.value || '10');
+
+    // Pass known function bounds from nm — avoids a second objdump scan
+    const fd = new FormData();
+    fd.append('elf',           S.elfFile);
+    fd.append('addr',          '0x' + addrInt.toString(16));
+    fd.append('context_lines', String(ctxLines));
+    fd.append('tools_json',    JSON.stringify(tools));
+    if (symResult?.sym?.addr)  fd.append('func_start', '0x' + symResult.sym.addr.toString(16));
+    if (symResult?.sym?.size)  fd.append('func_end',
+        '0x' + (symResult.sym.addr + symResult.sym.size).toString(16));
+
+    try {
+        const res = await fetch('/disassemble', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) {
+            body.innerHTML = `<div style="padding:14px;color:var(--red)">❌ ${d.error}</div>`;
+            return;
+        }
+
+        _lastDisasmResult = d;
+        renderDisassembly(d, _disasmShowFull);
+
+    } catch(e) {
+        body.innerHTML = `<div style="padding:14px;color:var(--red)">❌ Request failed: ${e.message}</div>`;
+    }
+}
+
+/**
+ * Render the disassembly listing.
+ *
+ * Handles five record types from the Python parser:
+ *   insn        — ARM instruction (coloured by category)
+ *   source_code — C source line (from -g DWARF data embedded in ELF)
+ *   source_loc  — file:line marker (e.g. "../src/file.c:122")
+ *   func_sig    — function signature ("BswSpi_Exchange():")
+ *   label       — objdump function header ("004012a0 <BswSpi_Exchange>:")
+ *   blank       — empty line
+ *
+ * The TARGET instruction (crash point) is highlighted with ► and a blue
+ * left border.  The C source line associated with it gets a red background.
+ *
+ * @param {object}  d         Disassembly result from /disassemble
+ * @param {boolean} showFull  true = show entire function, false = N-line context
+ */
+function renderDisassembly(d, showFull) {
+    if (!d || !d.instructions) return;
+
+    const body   = $('ai-disasm-body');
+    const fnEl   = $('ai-disasm-func');
+    const footer = $('ai-disasm-footer');
+
+    // ── Function header ───────────────────────────────────────────────────
+    if (fnEl && d.func_name) {
+        const start = d.func_start ? '0x' + d.func_start.toString(16).toUpperCase() : '?';
+        const end   = d.func_end   ? '0x' + d.func_end.toString(16).toUpperCase()   : '?';
+        fnEl.textContent = `${d.func_name}  (${start} – ${end})`;
+    }
+
+    // ── Fault analysis banner ─────────────────────────────────────────────
+    const faultBanner = $('ai-fault-banner');
+    if (d.fault_analysis) {
+        const fa  = d.fault_analysis;
+        const col = fa.confidence === 'high' ? 'high'
+                  : fa.confidence === 'medium' ? 'medium' : 'low';
+        faultBanner.style.display = '';
+        faultBanner.innerHTML =
+            `<div class="fault-banner ${col}">
+               <div class="fault-icon">${fa.icon}</div>
+               <div style="flex:1">
+                 <div class="fault-title">${_escHtml(fa.title)}</div>
+                 <div class="fault-conf ${col}">${fa.confidence.toUpperCase()} CONFIDENCE</div>
+                 <div class="fault-detail">${_escHtml(fa.detail)}</div>
+                 <div class="fault-desc">${_escHtml(fa.description)}</div>
+                 <div class="fault-fix">💡 ${_escHtml(fa.fix)}</div>
+               </div>
+             </div>`;
+    } else {
+        faultBanner.style.display = 'none';
+    }
+
+    // ── Aligned address notice (if input was not already aligned) ────────
+    const alignedAddr = d.target_addr_aligned;
+
+    // ── Build the listing ─────────────────────────────────────────────────
+    const records   = d.instructions;
+    const tIdx      = d.target_idx;
+    const ctxStart  = d.context_start;
+    const ctxEnd    = d.context_end;
+    // Which source line number corresponds to the target instruction?
+    const tSrcLine  = d.target_source_line || 0;
+
+    body.innerHTML  = '';
+    let foldShown   = false;
+    let targetEl    = null;
+
+    records.forEach((rec, i) => {
+        const inCtx    = i >= ctxStart && i <= ctxEnd;
+        const isTarget = i === tIdx;
+
+        // Context folding — show a clickable fold separator
+        if (!showFull && !inCtx && !isTarget) {
+            if (!foldShown || i === ctxEnd + 1) {
+                if (!foldShown) {
+                    const fold = document.createElement('div');
+                    fold.className = 'disasm-fold';
+                    fold.textContent = '···  ' +
+                        (ctxStart > 0
+                            ? `${ctxStart} lines above`
+                            : `${records.length - ctxEnd - 1} lines below`) +
+                        ' — click "Full fn" to expand';
+                    fold.addEventListener('click', () => {
+                        _disasmShowFull = true;
+                        const lbl = $('ai-disasm-toggle-lbl');
+                        if (lbl) lbl.textContent = 'Context';
+                        renderDisassembly(_lastDisasmResult, true);
+                    });
+                    body.appendChild(fold);
+                    foldShown = true;
+                }
+            }
+            return;
+        }
+        foldShown = false;
+
+        // ── source_loc: file:line marker ──────────────────────────────────
+        // e.g. "../src/Bsw/Bsw_Spi.c:147"
+        if (rec.type === 'source_loc') {
+            const el = document.createElement('div');
+            el.className = 'disasm-file-marker';
+            const parts = _normPath(rec.file || '').split('/');
+            const shortFile = parts.length >= 2 ? parts.slice(-2).join('/') : (rec.file || '');
+            el.innerHTML =
+                `<span style="color:var(--dim)">📄 ${_escHtml(shortFile)}</span>` +
+                (rec.line ? `<span style="color:#555d66">:${rec.line}</span>` : '');
+            if (!showFull && !inCtx) el.style.opacity = '0.3';
+            body.appendChild(el);
+            return;
+        }
+
+        // ── func_sig: function signature line ────────────────────────────
+        if (rec.type === 'func_sig') {
+            const el = document.createElement('div');
+            el.className = 'disasm-func-sig';
+            el.textContent = rec.text;
+            if (!showFull && !inCtx) el.style.opacity = '0.3';
+            body.appendChild(el);
+            return;
+        }
+
+        // ── source_code: C source line ────────────────────────────────────
+        if (rec.type === 'source_code') {
+            const el = document.createElement('div');
+            // Highlight the C source line that corresponds to the target instruction
+            const isTargetSrc = tSrcLine > 0 && rec._src_line === tSrcLine;
+            el.className = 'disasm-source' + (isTargetSrc ? ' target-source' : '');
+            el.textContent = rec.text;
+            if (!showFull && !inCtx) el.style.opacity = '0.3';
+            body.appendChild(el);
+            return;
+        }
+
+        // ── label: function header ────────────────────────────────────────
+        if (rec.type === 'label') {
+            const el = document.createElement('div');
+            el.className = 'disasm-label';
+            el.textContent = rec.text;
+            body.appendChild(el);
+            return;
+        }
+
+        // ── blank ─────────────────────────────────────────────────────────
+        if (rec.type === 'blank') {
+            return;  // skip blank lines — cleaner display
+        }
+
+        // ── insn: instruction line ────────────────────────────────────────
+        if (rec.type !== 'insn') return;
+
+        const row = document.createElement('div');
+        row.className = 'disasm-line' +
+            (isTarget ? ' target' : '') +
+            (!showFull && !inCtx ? ' dimmed' : '');
+
+        const addrHex = '0x' + rec.addr.toString(16).toUpperCase().padStart(8, '0');
+        const mnemCls = rec.is_load    ? 'is-load'
+                      : rec.is_store   ? 'is-store'
+                      : rec.is_branch  ? 'is-branch' : '';
+
+        row.innerHTML =
+            `<span class="dc-addr">${addrHex}</span>` +
+            `<span class="dc-bytes">${_escHtml(rec.raw_bytes)}</span>` +
+            `<span class="dc-mnem ${mnemCls}">${_escHtml(rec.mnemonic)}</span>` +
+            `<span class="dc-ops">${_escHtml(rec.operands)}</span>`;
+
+        if (isTarget) {
+            targetEl = row;
+            row.title = '► Crash point (Thumb-aligned) — click another row to change target';
+        } else {
+            row.title = 'Click to inspect this address';
+        }
+
+        row.style.cursor = 'pointer';
+        row.addEventListener('click', () => {
+            const inp = $('a2l-addr');
+            if (inp) inp.value = addrHex;
+            // Don't re-run full inspect — just update the input
+        });
+
+        body.appendChild(row);
+    });
+
+    // Scroll target into view after render completes
+    if (targetEl) {
+        requestAnimationFrame(() =>
+            targetEl.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────
+    if (footer) {
+        footer.style.display = '';
+        let html = '';
+        if (d.source_file && d.source_line) {
+            // Shorten the path for display
+            const shortFile = _normPath(d.source_file).split('/').pop();
+            html = `📄 <strong>${_escHtml(shortFile)}</strong>:<strong style="color:var(--acc)">${d.source_line}</strong>` +
+                   `<span style="color:var(--dim);margin-left:6px">${_escHtml(d.source_file)}</span>`;
+            if (!d.has_source) {
+                html += `<br><span style="color:var(--ora);font-size:10px">` +
+                    `Source lines not shown — rebuild with <code>-g</code> to interleave C source</span>`;
+            }
+        } else if (!d.has_source) {
+            html = `<span style="color:var(--dim)">No DWARF debug info in ELF. ` +
+                   `Rebuild with <code style="color:var(--acc)">-g</code> or <code style="color:var(--acc)">-g3</code> ` +
+                   `to see C source interleaved with disassembly.</span>`;
+        }
+        if (alignedAddr !== undefined && alignedAddr !== _lastDisasmAddr) {
+            html += `<br><span style="color:var(--dim);font-size:10px">` +
+                `Note: address aligned from ${hex(_lastDisasmAddr)} to ${hex(alignedAddr)} (Thumb-2 alignment)</span>`;
+        }
+        footer.innerHTML = html;
+    }
+}
+
+function toggleDisasmFull() {
+    _disasmShowFull = !_disasmShowFull;
+    const lbl = $('ai-disasm-toggle-lbl');
+    if (lbl) lbl.textContent = _disasmShowFull ? 'Context' : 'Full fn';
+    if (_lastDisasmResult) renderDisassembly(_lastDisasmResult, _disasmShowFull);
+}
+
+function rerunDisasm() {
+    if (!_lastDisasmAddr || !S.elfFile || !_lastDisasmResult) return;
+    // Re-fetch with new context lines setting
+    const symResult = { sym: {
+        addr: _lastDisasmResult.func_start,
+        size: (_lastDisasmResult.func_end || 0) - (_lastDisasmResult.func_start || 0),
+    }};
+    fetchDisassembly(_lastDisasmAddr, symResult);
+}
+
+function copyDisasm() {
+    if (!_lastDisasmResult) return;
+    const lines = _lastDisasmResult.instructions
+        .filter(ins => ins.type === 'insn' || ins.type === 'source')
+        .map(ins => ins.type === 'source'
+            ? '// ' + ins.text
+            : `  ${('0x'+ins.addr.toString(16).toUpperCase().padStart(8,'0'))}  ${ins.raw_bytes.padEnd(24)}  ${ins.mnemonic.padEnd(8)} ${ins.operands}`)
+        .join('\n');
+    navigator.clipboard.writeText(lines)
+        .then(() => alert('Disassembly copied to clipboard'))
+        .catch(() => alert('Copy failed — use Ctrl+A on the disassembly panel'));
+}
+
+// Safe path normaliser — avoids regex with backslash (syntax issues in bundles)
+function _normPath(p) { return String(p || '').split('\\').join('/'); }
+
+function _escHtml(s) {
+    return String(s||'')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// =============================================================================
+// DISASSEMBLY — SOURCE FILE SUPPORT, REGISTER ANALYSIS, RAW VIEW
+// =============================================================================
+//
+// Source path resolution:
+//   GCC bakes source paths into DWARF sections at compile time.
+//   On the same machine, objdump -S resolves them automatically.
+//   On a different machine (e.g. CI built, analysing on Windows dev machine):
+//     - The DWARF paths are relative to the build directory on the build machine
+//     - objdump can't find the files → no source interleaving
+//   Solution: user provides the local source root, server tries path remapping
+//   with --prefix-strip + --prefix, or reads the file directly and injects lines.
+//
+//   Additionally: user can drop .c/.h files directly, which we match to the
+//   addr2line-reported filename and inject source manually.
+//
+// Register analysis:
+//   Cortex-M fault registers give precise information about what went wrong.
+//   CFSR (Configurable Fault Status Register) has a bit for every fault type.
+//   LR on ISR entry encodes the EXC_RETURN pattern (which stack, FPU used etc.)
+//   We decode these into human-readable explanations alongside the disassembly.
+// =============================================================================
+
+// In-memory source files dropped by user: { filename → [line1, line2, ...] }
+// =============================================================================
+// SOURCE FILE MANAGEMENT
+// =============================================================================
+//
+// Three ways to provide source files:
+//
+//   1. Server-side scan (recommended)
+//      Type the source root directory path → server walks the whole tree →
+//      file picker appears (same UX as .su/.ci) → load selected.
+//      Path is persisted in sessionStorage until page refresh.
+//
+//   2. Drag-and-drop / file picker
+//      Drop .c/.h files directly onto the drop zone.
+//      The browser reads them client-side — no server access needed.
+//
+//   3. objdump --source auto-resolve (transparent)
+//      If the ELF was built on this same machine, objdump finds the files
+//      automatically from the paths baked into DWARF. No UI needed.
+//
+// STORAGE:
+//   _srcStore — in-memory map {filename → [line0_unused, line1, line2, ...]}
+//   Persisted across inspections until the page is refreshed.
+//   sessionStorage saves the last-used directory path.
+//
+// SOURCE LINE INJECTION:
+//   When objdump couldn't find source lines but we have a file in _srcStore
+//   that matches the addr2line-reported filename, we inject source_code
+//   records around the crash line into the instruction list.
+//   The number of lines injected is user-controlled via the context dropdown.
+// =============================================================================
+
+// In-memory source store — persists until page refresh
+// { filename → ['', line1_text, line2_text, ...] }  (index 0 unused so indices = line numbers)
+const _srcStore = {};
+let   _srcScanResults = [];   // [{path, name, ext, dir, selected}]
+let   _srcRootPath = '';      // last used directory
+
+// ── Initialise source drop zone ───────────────────────────────────────────────
+
+function initSourceDrop() {
+    const drop = document.getElementById('ai-src-drop');
+    const inp  = document.getElementById('ai-src-file-picker');
+    if (!drop || !inp) return;
+
+    drop.addEventListener('dragover',  e => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', e => {
+        e.preventDefault(); drop.classList.remove('over');
+        onSourceFilePick(e.dataTransfer.files);
+    });
+    drop.addEventListener('click', e => { if (e.target !== inp) inp.click(); });
+    inp.addEventListener('change', e => { onSourceFilePick(e.target.files); inp.value = ''; });
+
+    // Restore last-used directory from sessionStorage
+    const saved = sessionStorage.getItem('lmv_src_dir');
+    if (saved) {
+        const el = document.getElementById('ai-src-dir');
+        if (el) el.value = saved;
+    }
+}
+
+// ── Path scan (server-side walk of entire tree) ───────────────────────────────
+
+async function scanSourceDir() {
+    const pathEl = document.getElementById('ai-src-dir');
+    const path   = (pathEl?.value || '').trim();
+    if (!path) { setSrcStatus('Enter a directory path first'); return; }
+
+    setSrcStatus('Scanning…');
+    document.getElementById('ai-src-picker').style.display = 'none';
+
+    try {
+        const fd = new FormData();
+        fd.append('path', path);
+        const res = await fetch('/scan_source', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) { setSrcStatus('Error: ' + d.error); return; }
+        if (!d.files || !d.files.length) {
+            setSrcStatus('No source files found. Check path and try parent directory.');
+            return;
+        }
+
+        // Save path for session persistence
+        _srcRootPath = path;
+        sessionStorage.setItem('lmv_src_dir', path);
+
+        _srcScanResults = d.files.map(f => ({ ...f, selected: _shouldAutoSelect(f) }));
+        setSrcStatus('');
+        renderSourcePicker(d.files.length, d.root);
+    } catch(e) {
+        setSrcStatus('Scan failed: ' + e.message);
+    }
+}
+
+/**
+ * Auto-select heuristic: prefer .c and .cpp over .h in initial selection,
+ * but always auto-select if filename matches the current crash source file.
+ */
+function _shouldAutoSelect(f) {
+    const crashFile = _lastDisasmResult?.source_file
+        ? _normPath(_lastDisasmResult.source_file).split('/').pop()
+        : '';
+    if (crashFile && f.name === crashFile) return true;   // exact match — always select
+    return ['.c', '.cpp', '.cxx', '.cc'].includes(f.ext); // default: select implementation files
+}
+
+// ── Picker rendering (same style as .su/.ci picker) ──────────────────────────
+
+function renderSourcePicker(total, root) {
+    const picker = document.getElementById('ai-src-picker');
+    const list   = document.getElementById('ai-src-picker-list');
+    const title  = document.getElementById('ai-src-picker-title');
+    if (!picker || !list || !title) return;
+
+    // Shorten root path for display
+    const displayRoot = root ? _normPath(root).split('/').slice(-2).join('/') : '';
+    title.textContent = `${total} source file${total !== 1 ? 's' : ''} found in ${displayRoot || root}`;
+    list.innerHTML = '';
+
+    // Group by directory
+    const dirs = {};
+    _srcScanResults.forEach(f => {
+        if (!dirs[f.dir]) dirs[f.dir] = [];
+        dirs[f.dir].push(f);
+    });
+
+    // Colour by extension
+    const extCol = e =>
+        e === '.c' || e === '.cpp' ? 'var(--acc)' :
+        e === '.h' || e === '.hpp' ? 'var(--grn)' :
+        e === '.s' || e === '.asm' ? 'var(--pur)' : 'var(--dim)';
+
+    // Crash source file — highlight it
+    const crashFile = _lastDisasmResult?.source_file
+        ? _normPath(_lastDisasmResult.source_file).split('/').pop()
+        : '';
+
+    Object.keys(dirs).sort().forEach(dir => {
+        // Directory group header
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'padding:4px 6px 2px;font-size:10px;color:var(--acc);' +
+            'font-weight:600;border-top:1px solid var(--bdr);margin-top:3px';
+        hdr.textContent = dir;
+        list.appendChild(hdr);
+
+        dirs[dir].forEach(f => {
+            const isCrash = crashFile && f.name === crashFile;
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:3px 6px;' +
+                'border-radius:3px;cursor:pointer;' + (isCrash ? 'background:#0d2140;' : '');
+            row.innerHTML =
+                `<input type="checkbox" ${f.selected ? 'checked' : ''}` +
+                ` style="accent-color:var(--acc);flex-shrink:0">` +
+                `<span style="font-size:10px;color:${extCol(f.ext)};flex-shrink:0;` +
+                    `width:36px">${f.ext}</span>` +
+                `<span style="font-size:11px;color:${isCrash ? 'var(--acc)' : '#fff'};` +
+                    `font-weight:${isCrash ? '600' : '400'}">${f.name}` +
+                    `${isCrash ? ' ← crash file' : ''}</span>` +
+                `<span style="font-size:10px;color:var(--dim);margin-left:auto">` +
+                    `${(f.size / 1024).toFixed(1)}KB</span>`;
+
+            const cb = row.querySelector('input');
+            cb.addEventListener('change', () => { f.selected = cb.checked; });
+            row.addEventListener('click', e => {
+                if (e.target !== cb) { f.selected = !f.selected; cb.checked = f.selected; }
+            });
+            row.addEventListener('mouseenter', () => { if (!isCrash) row.style.background = 'var(--s2)'; });
+            row.addEventListener('mouseleave', () => { if (!isCrash) row.style.background = ''; });
+            list.appendChild(row);
+        });
+    });
+
+    picker.style.display = '';
+}
+
+function srcPickerAll()  { _srcScanResults.forEach(f => f.selected = true);  renderSourcePicker(_srcScanResults.length, _srcRootPath); }
+function srcPickerNone() { _srcScanResults.forEach(f => f.selected = false); renderSourcePicker(_srcScanResults.length, _srcRootPath); }
+function srcPickerExt(ext) {
+    _srcScanResults.forEach(f => f.selected = f.ext === ext);
+    renderSourcePicker(_srcScanResults.length, _srcRootPath);
+}
+
+// ── Load selected files (server reads them) ───────────────────────────────────
+
+async function loadSelectedSource() {
+    const selected = _srcScanResults.filter(f => f.selected);
+    if (!selected.length) { alert('Select at least one file'); return; }
+
+    const btn = document.querySelector('[onclick="loadSelectedSource()"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+    setSrcStatus(`Loading ${selected.length} file${selected.length !== 1 ? 's' : ''}…`);
+
+    try {
+        const fd = new FormData();
+        fd.append('paths', JSON.stringify(selected.map(f => f.path)));
+        const res = await fetch('/load_source_files', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) { setSrcStatus('Error: ' + d.error); return; }
+
+        d.files.forEach(f => storeSourceFile(f.name, f.content));
+
+        document.getElementById('ai-src-picker').style.display = 'none';
+        setSrcStatus('');
+        updateSrcChips();
+        injectUserSourceIntoDisasm();
+    } catch(e) {
+        setSrcStatus('Load failed: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Load selected'; }
+    }
+}
+
+// ── Drag-and-drop / file picker ───────────────────────────────────────────────
+
+function onSourceFilePick(fileList) {
+    const files = Array.from(fileList);
+    if (!files.length) return;
+
+    let loaded = 0;
+    const label = document.getElementById('ai-src-drop-label');
+
+    files.forEach(file => {
+        const reader = new FileReader();
+        reader.onload = e => {
+            storeSourceFile(file.name, e.target.result);
+            loaded++;
+            if (loaded === files.length) {
+                if (label) label.textContent =
+                    `${Object.keys(_srcStore).length} file${Object.keys(_srcStore).length !== 1 ? 's' : ''} loaded`;
+                updateSrcChips();
+                injectUserSourceIntoDisasm();
+            }
+        };
+        reader.readAsText(file);
+    });
+}
+
+// ── Source store ──────────────────────────────────────────────────────────────
+
+function storeSourceFile(name, content) {
+    // Index 0 unused — lines[lineNumber] = text, matching 1-based line numbers
+    _srcStore[name] = [''].concat(content.split('\n'));
+}
+
+function clearSourceFiles() {
+    Object.keys(_srcStore).forEach(k => delete _srcStore[k]);
+    _srcScanResults = [];
+    updateSrcChips();
+    setSrcStatus('');
+    const label = document.getElementById('ai-src-drop-label');
+    if (label) label.textContent = 'Drop .c/.h files here';
+}
+
+function closeSrcBar() {
+    const bar = document.getElementById('ai-src-bar');
+    if (bar) bar.style.display = 'none';
+}
+
+function setSrcStatus(msg) {
+    const el = document.getElementById('ai-src-status');
+    if (el) el.textContent = msg;
+}
+
+function updateSrcChips() {
+    const loaded = document.getElementById('ai-src-loaded');
+    const chips  = document.getElementById('ai-src-chips');
+    const names  = Object.keys(_srcStore);
+    if (!loaded || !chips) return;
+    loaded.style.display = names.length ? '' : 'none';
+    chips.innerHTML = '';
+    names.forEach(name => {
+        const chip = document.createElement('div');
+        chip.style.cssText = 'display:flex;align-items:center;gap:4px;background:var(--s2);' +
+            'border:1px solid var(--bdr);border-radius:3px;padding:1px 6px;font-size:10px;color:#8b949e';
+        chip.innerHTML = `<span>${name}</span>` +
+            `<span style="cursor:pointer;color:var(--dim)" title="Remove">✕</span>`;
+        chip.querySelector('span:last-child').addEventListener('click', () => {
+            delete _srcStore[name];
+            updateSrcChips();
+        });
+        chips.appendChild(chip);
+    });
+}
+
+// ── Source injection into disassembly ─────────────────────────────────────────
+
+/**
+ * Insert source lines from _srcStore into the current disassembly result.
+ *
+ * Matches by filename — uses the addr2line-reported source_file basename.
+ * The number of context lines is controlled by the #ai-src-ctx dropdown.
+ *
+ * Call this after new files are loaded, or when context lines dropdown changes.
+ */
+function injectUserSourceIntoDisasm() {
+    if (!_lastDisasmResult) return;
+    const d = _lastDisasmResult;
+
+    // Identify the source filename we need
+    const srcFilename = d.source_file
+        ? _normPath(d.source_file).split('/').pop()
+        : '';
+
+    // Find it in the store — exact match or suffix match
+    const srcLines = srcFilename
+        ? (_srcStore[srcFilename]
+           || Object.entries(_srcStore).find(([k]) => k.endsWith(srcFilename))?.[1])
+        : null;
+
+    if (!srcLines) {
+        if (srcFilename) setSrcStatus(`"${srcFilename}" not in loaded files`);
+        return;
+    }
+
+    const targetLine = d.source_line || d.target_source_line || 0;
+    if (!targetLine) {
+        setSrcStatus('No line number from addr2line');
+        return;
+    }
+
+    // User-controlled context lines
+    const ctxN = parseInt(document.getElementById('ai-src-ctx')?.value || '5');
+    const startLine = ctxN === 0 ? 1 : Math.max(1, targetLine - ctxN);
+    const endLine   = ctxN === 0
+        ? srcLines.length - 1
+        : Math.min(srcLines.length - 1, targetLine + ctxN);
+
+    // Build injection — insert source records just before the target instruction
+    // and a source_loc header before the block
+    const injected = [];
+    let injected_flag = false;
+
+    // First pass: strip any previously injected source records
+    // (so re-running with different ctxN doesn't stack)
+    const base = (d._base_instructions || d.instructions).filter(r =>
+        r.type !== 'source_code' || r._injected !== true
+    );
+
+    base.forEach((rec, i) => {
+        if (!injected_flag && rec.type === 'insn' && i === (d._base_target_idx ?? d.target_idx)) {
+            injected.push({
+                type: 'source_loc',
+                file: srcFilename,
+                line: startLine,
+                text: srcFilename + ':' + startLine,
+            });
+            for (let ln = startLine; ln <= endLine; ln++) {
+                injected.push({
+                    type:      'source_code',
+                    text:      srcLines[ln] || '',
+                    _src_line: ln,
+                    _injected: true,   // marks user-injected records for cleanup
+                });
+            }
+            injected_flag = true;
+        }
+        injected.push(rec);
+    });
+
+    // Recompute context window for the injected list
+    const newTargetIdx = injected.findIndex(
+        (r, i) => r === d.instructions[d.target_idx] || (r.type === 'insn' && r.addr === d.target_addr_aligned)
+    );
+
+    const newResult = {
+        ...d,
+        instructions:       injected,
+        target_idx:         newTargetIdx >= 0 ? newTargetIdx : d.target_idx,
+        target_source_line: targetLine,
+        has_source:         true,
+        _base_instructions: base,                          // keep for re-inject
+        _base_target_idx:   d._base_target_idx ?? d.target_idx,
+    };
+
+    // Recompute context start/end for the injected instruction list
+    const insn_idxs = injected.map((r,i) => r.type === 'insn' ? i : -1).filter(i => i >= 0);
+    if (insn_idxs.length && newTargetIdx >= 0) {
+        const rank  = insn_idxs.findIndex(i => i >= newTargetIdx);
+        const safeR = rank >= 0 ? rank : insn_idxs.length - 1;
+        const lo = insn_idxs[Math.max(0, safeR - parseInt(document.getElementById('ai-ctx-lines')?.value || '10'))];
+        const hi = insn_idxs[Math.min(insn_idxs.length - 1, safeR + parseInt(document.getElementById('ai-ctx-lines')?.value || '10'))];
+        newResult.context_start = lo;
+        newResult.context_end   = hi;
+    }
+
+    _lastDisasmResult = newResult;
+    renderDisassembly(newResult, _disasmShowFull);
+
+    const bar = document.getElementById('ai-src-bar');
+    if (bar) bar.style.display = 'none';
+    setSrcStatus('');
+}
+
+// ── Source bar visibility ─────────────────────────────────────────────────────
+
+/**
+ * Show or hide the source panel based on whether source lines resolved.
+ * Always shown if files are already in the store (persist across inspections).
+ */
+function updateSourceBar(d) {
+    const bar = document.getElementById('ai-src-bar');
+    if (!bar) return;
+
+    const hasStore = Object.keys(_srcStore).length > 0;
+
+    if (!d.has_source && d.source_file) {
+        // Source known but didn't resolve — show the panel
+        bar.style.display = '';
+
+        // Pre-fill path hint from the ELF-embedded source path
+        const pathEl = document.getElementById('ai-src-dir');
+        if (pathEl && !pathEl.value) {
+            const parts = _normPath(d.source_file).split('/');
+            const hint  = parts.slice(0, -2).join('/');
+            if (hint) pathEl.placeholder = `e.g. ${hint}`;
+        }
+
+        // If we already have the file in store, inject immediately
+        if (hasStore) {
+            injectUserSourceIntoDisasm();
+        }
+    } else if (hasStore) {
+        // Source resolved via objdump, but still show bar so user can manage files
+        bar.style.display = 'none';
+        // Still try injection in case store has better coverage
+        if (!d.has_source) injectUserSourceIntoDisasm();
+    } else {
+        bar.style.display = 'none';
+    }
+
+    // Restore session-stored path
+    const saved = sessionStorage.getItem('lmv_src_dir');
+    const pathEl = document.getElementById('ai-src-dir');
+    if (pathEl && saved && !pathEl.value) pathEl.value = saved;
+
+    updateSrcChips();
+}
+
+function rerunDisasmWithSource() {
+    if (!_lastDisasmAddr || !S.elfFile) return;
+    const srcDir = (document.getElementById('ai-src-dir')?.value || '').trim();
+    if (srcDir) sessionStorage.setItem('lmv_src_dir', srcDir);
+    fetchDisassembly(_lastDisasmAddr,
+        { sym: { addr: _lastDisasmResult?.func_start,
+                 size: (_lastDisasmResult?.func_end||0) - (_lastDisasmResult?.func_start||0) } },
+        srcDir);
+}
+
+
+// ── Register analysis panel ───────────────────────────────────────────────────
+
+let _regPanelVisible = false;
+function toggleRegPanel() {
+    _regPanelVisible = !_regPanelVisible;
+    const panel = document.getElementById('ai-reg-panel');
+    if (panel) panel.style.display = _regPanelVisible ? '' : 'none';
+}
+
+// Show the register panel when a fault is detected
+function showRegPanelForFault() {
+    _regPanelVisible = true;
+    const panel = document.getElementById('ai-reg-panel');
+    if (panel) panel.style.display = '';
+}
+
+/**
+ * Decode CPU registers and produce a plain-English explanation.
+ *
+ * CFSR (0xE000ED28) bits:
+ *   [0]     IACCVIOL  — instruction fetch from non-executable region
+ *   [1]     DACCVIOL  — data access to non-executable region (MPU)
+ *   [3]     MUNSTKERR — unstacking for exception return caused MPU violation
+ *   [4]     MSTKERR   — stacking for exception entry caused MPU violation
+ *   [5]     MLSPERR   — lazy FP state preservation MPU violation (M4/M7 only)
+ *   [7]     MMARVALID — MMFAR holds the address of the MPU violation
+ *   [8]     IBUSERR   — instruction bus error
+ *   [9]     PRECISERR — precise data bus error (BFAR is valid)
+ *   [10]    IMPRECISERR — imprecise bus error (BFAR may not be valid)
+ *   [11]    UNSTKERR  — BusFault on unstacking
+ *   [12]    STKERR    — BusFault on stacking
+ *   [15]    BFARVALID — BFAR holds the bus fault address
+ *   [16]    UNDEFINSTR — undefined instruction
+ *   [17]    INVSTATE  — illegal EPSR.T or EPSR.IT
+ *   [18]    INVPC     — integrity check failure on EXC_RETURN
+ *   [19]    NOCP      — no coprocessor (FPU not enabled)
+ *   [24]    UNALIGNED — unaligned access (when CCR.UNALIGN_TRP is set)
+ *   [25]    DIVBYZERO — divide by zero (when CCR.DIV_0_TRP is set)
+ *
+ * LR EXC_RETURN values:
+ *   0xFFFFFFF1 — return to Handler mode, MSP, no FPU
+ *   0xFFFFFFF9 — return to Thread mode,  MSP, no FPU
+ *   0xFFFFFFFD — return to Thread mode,  PSP, no FPU
+ *   0xFFFFFFE1 — return to Handler mode, MSP, FPU (M4/M7 only)
+ *   0xFFFFFFE9 — return to Thread mode,  MSP, FPU (M4/M7 only)
+ *   0xFFFFFFED — return to Thread mode,  PSP, FPU (M4/M7 only)
+ */
+function updateRegAnalysis() {
+    const out = document.getElementById('reg-analysis-out');
+    if (!out) return;
+
+    const parse = id => {
+        const v = (document.getElementById(id)?.value || '').trim();
+        if (!v) return null;
+        try { return parseInt(v, 0); } catch(e) { return null; }
+    };
+
+    const pc   = parse('reg-pc');
+    const lr   = parse('reg-lr');
+    const sp   = parse('reg-sp');
+    const bfar = parse('reg-bfar');
+    const cfsr = parse('reg-cfsr');
+
+    if (pc === null && cfsr === null && bfar === null) {
+        out.innerHTML = '';
+        return;
+    }
+
+    const lines = [];
+
+    // ── LR decode ──────────────────────────────────────────────────────
+    if (lr !== null) {
+        const EXC_RETURNS = {
+            0xFFFFFFF1: 'Handler mode, Main Stack (MSP), no FPU context',
+            0xFFFFFFF9: 'Thread mode,  Main Stack (MSP), no FPU context',
+            0xFFFFFFFD: 'Thread mode,  Process Stack (PSP) ← FreeRTOS task',
+            0xFFFFFFE1: 'Handler mode, Main Stack (MSP), FPU context saved',
+            0xFFFFFFE9: 'Thread mode,  Main Stack (MSP), FPU context saved',
+            0xFFFFFFED: 'Thread mode,  Process Stack (PSP), FPU context saved',
+        };
+        const exc = EXC_RETURNS[lr >>> 0];
+        if (exc) {
+            lines.push(`<b style="color:var(--acc)">LR (EXC_RETURN)</b>: ${exc}`);
+            if ((lr & 0xFFFFFFE0) === 0xFFFFFFE0 && (lr & 0x10) === 0) {
+                lines.push(`&nbsp;&nbsp;⚠ FPU context on stack — ensure <code>configUSE_TASK_FPU_SUPPORT=2</code> if using FPU in tasks`);
+            }
+            if (lr === 0xFFFFFFFD) {
+                lines.push(`&nbsp;&nbsp;✓ This fault occurred in a FreeRTOS task (PSP in use)`);
+            }
+        } else if ((lr & 1) === 0) {
+            lines.push(`<b style="color:var(--red)">LR bit 0 = 0</b>: LR is not a Thumb address or EXC_RETURN pattern. This is unusual and may indicate stack corruption.`);
+        }
+    }
+
+    // ── CFSR decode ────────────────────────────────────────────────────
+    if (cfsr !== null) {
+        lines.push(`<b style="color:var(--acc)">CFSR 0x${cfsr.toString(16).toUpperCase().padStart(8,'0')}</b>:`);
+        const CFSR_BITS = [
+            [0,  'MemManage', 'IACCVIOL',   'Instruction fetch from MPU-prohibited region'],
+            [1,  'MemManage', 'DACCVIOL',   'Data access to MPU-prohibited region'],
+            [3,  'MemManage', 'MUNSTKERR',  'MPU fault on exception return (unstacking)'],
+            [4,  'MemManage', 'MSTKERR',    'MPU fault on exception entry (stacking)'],
+            [5,  'MemManage', 'MLSPERR',    'Lazy FP save MPU violation'],
+            [7,  'MemManage', 'MMARVALID',  'MMFAR register contains valid address'],
+            [8,  'BusFault',  'IBUSERR',    'Instruction bus error (prefetch fault)'],
+            [9,  'BusFault',  'PRECISERR',  'Precise data bus error — BFAR is valid'],
+            [10, 'BusFault',  'IMPRECISERR','Imprecise bus error — BFAR may be stale'],
+            [11, 'BusFault',  'UNSTKERR',   'Bus fault on exception return (unstacking)'],
+            [12, 'BusFault',  'STKERR',     'Bus fault on exception entry (stacking)'],
+            [15, 'BusFault',  'BFARVALID',  'BFAR register contains valid address'],
+            [16, 'UsageFault','UNDEFINSTR', 'Undefined instruction — check Thumb state'],
+            [17, 'UsageFault','INVSTATE',   'Invalid EPSR state — likely non-Thumb branch'],
+            [18, 'UsageFault','INVPC',      'Invalid PC on exception return — corrupt LR'],
+            [19, 'UsageFault','NOCP',       'No coprocessor — FPU not enabled (check CPACR)'],
+            [24, 'UsageFault','UNALIGNED',  'Unaligned memory access with UNALIGN_TRP set'],
+            [25, 'UsageFault','DIVBYZERO',  'Divide by zero with DIV_0_TRP set'],
+        ];
+        let anySet = false;
+        const typeColors = {MemManage:'var(--ora)', BusFault:'var(--red)', UsageFault:'var(--acc)'};
+        CFSR_BITS.forEach(([bit, type, name, desc]) => {
+            if (cfsr & (1 << bit)) {
+                anySet = true;
+                const col = typeColors[type] || 'var(--txt)';
+                lines.push(`&nbsp;&nbsp;<span style="color:${col}">[${type}] ${name}</span>: ${desc}`);
+            }
+        });
+        if (!anySet) lines.push('&nbsp;&nbsp;<span style="color:var(--dim)">No fault bits set</span>');
+    }
+
+    // ── BFAR / MMFAR ──────────────────────────────────────────────────
+    if (bfar !== null && bfar !== 0) {
+        const bfarHex = '0x' + bfar.toString(16).toUpperCase().padStart(8,'0');
+        let region = 'unknown region';
+        if (bfar < 0x100)         region = 'NULL window — likely null pointer dereference';
+        else if (bfar < 0x10000000) region = 'flash / code memory range';
+        else if (bfar < 0x20000000) region = 'external bus / QSPI range';
+        else if (bfar < 0x40000000) region = 'SRAM range';
+        else if (bfar < 0xE0000000) region = 'peripheral register space';
+        else                        region = 'system space (SCS/PPB)';
+        lines.push(`<b style="color:var(--acc)">BFAR</b>: ${bfarHex} — ${region}`);
+        if ((cfsr !== null) && !(cfsr & (1 << 15))) {
+            lines.push('&nbsp;&nbsp;<span style="color:var(--ora)">⚠ BFARVALID bit NOT set — this address may be from a previous fault</span>');
+        }
+        // Offer to inspect this address
+        lines.push(`&nbsp;&nbsp;<a href="#" style="color:var(--acc)" ` +
+            `onclick="event.preventDefault();$('a2l-addr').value='${bfarHex}';inspectAddress()">` +
+            `→ Inspect BFAR address in Address Inspector</a>`);
+    }
+
+    // ── SP sanity check ────────────────────────────────────────────────
+    if (sp !== null && S.ld) {
+        const stackSec = S.ld.sections.find(s => s.name.toLowerCase().includes('stack'));
+        const stackReg = S.ld.regions.find(r => r.name.toLowerCase().includes('dtcm')
+            || r.name.toLowerCase().includes('sram'));
+        if (stackReg) {
+            if (sp < stackReg.origin || sp > stackReg.end) {
+                lines.push(`<b style="color:var(--red)">SP 0x${sp.toString(16).toUpperCase()}</b>: ` +
+                    `outside ${stackReg.name} region (0x${stackReg.origin.toString(16)}–0x${stackReg.end.toString(16)}) — stack corrupted or overflowed`);
+            } else {
+                lines.push(`<b style="color:var(--grn)">SP 0x${sp.toString(16).toUpperCase()}</b>: within ${stackReg.name} region ✓`);
+            }
+        }
+    }
+
+    out.innerHTML = lines.join('<br>');
+}
+
+// ── Raw objdump output viewer ─────────────────────────────────────────────────
+
+function showRawObjdump() {
+    const modal = document.getElementById('ai-raw-modal');
+    const pre   = document.getElementById('ai-raw-out');
+    if (!modal || !pre) return;
+    pre.textContent = _lastDisasmResult?.raw_objdump || 'No raw output available — run Inspect first';
+    modal.style.display = '';
+}
+
+// ── Hook into fetchDisassembly to pass source_dir ────────────────────────────
+// Override the fetchDisassembly call signature to accept optional sourceDir
+const _fetchDisasmOrig = fetchDisassembly;
+fetchDisassembly = async function(addrInt, symResult, sourceDir) {
+    if (!S.elfFile) return;
+    _lastDisasmAddr = addrInt;
+
+    const panel = document.getElementById('ai-disasm-panel');
+    const body  = document.getElementById('ai-disasm-body');
+    if (panel) panel.style.display = '';
+    if (body)  body.innerHTML = '<div style="padding:14px;color:var(--dim)">⏳ Disassembling…</div>';
+
+    const faultBanner = document.getElementById('ai-fault-banner');
+    if (faultBanner) faultBanner.style.display = 'none';
+
+    const srcDir = sourceDir
+        || (document.getElementById('ai-src-dir')?.value || '').trim()
+        || '';
+
+    const tools = {
+        nm:      document.getElementById('t-nm')?.value.trim()     || 'arm-none-eabi-nm',
+        re:      document.getElementById('t-re')?.value.trim()     || 'arm-none-eabi-readelf',
+        size:    document.getElementById('t-sz')?.value.trim()     || 'arm-none-eabi-size',
+        a2l:     document.getElementById('t-a2l')?.value.trim()    || 'arm-none-eabi-addr2line',
+        objdump: 'arm-none-eabi-objdump',
+        prefix:  document.getElementById('t-prefix')?.value.trim() || '',
+    };
+
+    const ctxLines = parseInt(document.getElementById('ai-ctx-lines')?.value || '10');
+    const fd = new FormData();
+    fd.append('elf', S.elfFile);
+    fd.append('addr', '0x' + addrInt.toString(16));
+    fd.append('context_lines', String(ctxLines));
+    fd.append('tools_json', JSON.stringify(tools));
+    if (srcDir) fd.append('source_dir', srcDir);
+    if (symResult?.sym?.addr)
+        fd.append('func_start', '0x' + symResult.sym.addr.toString(16));
+    if (symResult?.sym?.size)
+        fd.append('func_end',
+            '0x' + (symResult.sym.addr + symResult.sym.size).toString(16));
+
+    try {
+        const res = await fetch('/disassemble', { method: 'POST', body: fd });
+        const d   = await res.json();
+
+        if (d.error) {
+            if (body) body.innerHTML =
+                `<div style="padding:14px;color:var(--red)">❌ ${_escHtml(d.error)}</div>`;
+            return;
+        }
+
+        _lastDisasmResult = d;
+        renderDisassembly(d, _disasmShowFull);
+        updateSourceBar(d);
+
+        // Auto-show register panel if a fault pattern was detected
+        if (d.fault_analysis) showRegPanelForFault();
+
+    } catch(e) {
+        if (body) body.innerHTML =
+            `<div style="padding:14px;color:var(--red)">❌ Request failed: ${_escHtml(e.message)}</div>`;
+    }
+};

@@ -448,3 +448,142 @@ progress::-moz-progress-bar      { background: var(--acc); border-radius: 2px; }
 
 /* Chain cell in stack table — underlined dotted to signal interactivity */
 .chain-cell:hover { color: #79baff !important; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DISASSEMBLY VIEW
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.disasm-line {
+    display:flex;
+    align-items:flex-start;
+    gap:0;
+    padding:1px 0;
+    border-bottom:1px solid #0a0e14;
+    line-height:1.6;
+}
+.disasm-line:hover { background:#0c111a; }
+
+/* Target instruction — highlighted row */
+.disasm-line.target {
+    background:#0d2140 !important;
+    border-left:3px solid var(--acc);
+    position:relative;
+}
+.disasm-line.target::before {
+    content:'►';
+    color:var(--acc);
+    position:absolute;
+    left:-1px;
+    font-size:10px;
+    top:3px;
+}
+
+/* Dimmed context (outside the N-line window) */
+.disasm-line.dimmed { opacity:0.35; }
+
+/* C source line embedded in disassembly */
+.disasm-source {
+    padding:3px 14px;
+    color:#6e7681;
+    font-size:11px;
+    background:#0a0e14;
+    border-left:3px solid #21262d;
+    white-space:pre;
+    display:block;
+}
+.disasm-source:hover { color:#8b949e; }
+
+/* Columns within an instruction row */
+.dc-addr   { color:#3b82f6; width:90px; flex-shrink:0; padding:2px 6px 2px 14px; font-size:11px; }
+.dc-bytes  { color:#374151; width:110px; flex-shrink:0; padding:2px 4px; font-size:10px; }
+.dc-mnem   { color:#e2a64a; width:70px; flex-shrink:0; padding:2px 4px; font-weight:600; }
+.dc-ops    { color:#c9d1d9; flex:1; padding:2px 4px; }
+.dc-mnem.is-load  { color:#3fb950; }
+.dc-mnem.is-store { color:#f97316; }
+.dc-mnem.is-branch{ color:#bc8cff; }
+
+/* Fault analysis banner */
+.fault-banner {
+    display:flex;
+    align-items:flex-start;
+    gap:12px;
+    padding:12px 16px;
+    border-radius:0;
+}
+.fault-banner.high   { background:#140808; border-left:4px solid var(--red); }
+.fault-banner.medium { background:#100c05; border-left:4px solid var(--ora); }
+.fault-banner.low    { background:#080f10; border-left:4px solid var(--acc); }
+.fault-icon  { font-size:24px; flex-shrink:0; }
+.fault-title { font-size:13px; font-weight:600; color:#fff; margin-bottom:3px; font-family:var(--ui); }
+.fault-detail{ font-size:11px; color:var(--ora); margin-bottom:5px; }
+.fault-desc  { font-size:11px; color:#8b949e; line-height:1.6; margin-bottom:6px; }
+.fault-fix   { font-size:11px; color:var(--acc); line-height:1.6; }
+.fault-conf  { font-size:10px; padding:1px 6px; border-radius:3px; border:1px solid;
+               display:inline-block; margin-bottom:6px; }
+.fault-conf.high   { color:var(--red); border-color:#5a1a1a; background:#200d0d; }
+.fault-conf.medium { color:var(--ora); border-color:#5a3d1a; background:#100c05; }
+.fault-conf.low    { color:var(--acc); border-color:#1a3a6a; background:#0d1e33; }
+
+/* ── Additional disassembly record types ─────────────────────────────────── */
+
+/* File:line location marker between instruction blocks */
+.disasm-file-marker {
+    padding:4px 14px 2px;
+    font-size:10px;
+    font-family:var(--mono);
+    background:#0a0e14;
+    border-left:3px solid #21262d;
+    display:flex;
+    gap:0;
+}
+
+/* Function signature line e.g. "BswSpi_Exchange():" */
+.disasm-func-sig {
+    padding:4px 14px;
+    font-size:11px;
+    color:#6e7681;
+    font-style:italic;
+}
+
+/* Function header label e.g. "004012a0 <BswSpi_Exchange>:" */
+.disasm-label {
+    padding:8px 14px 3px;
+    font-size:12px;
+    color:var(--acc);
+    font-weight:600;
+    border-top:1px solid var(--bdr);
+    margin-top:4px;
+}
+
+/* C source code line — normal */
+.disasm-source {
+    padding:2px 14px;
+    color:#6e7681;
+    font-size:11px;
+    background:#0a0e14;
+    border-left:3px solid #21262d;
+    white-space:pre;
+    display:block;
+    font-family:var(--mono);
+}
+
+/* C source code line — HIGHLIGHTED (corresponds to crash instruction) */
+.disasm-source.target-source {
+    background:#200d0d !important;
+    border-left-color: var(--red) !important;
+    color:#ff9999 !important;
+}
+
+/* Fold indicator */
+.disasm-fold {
+    padding:4px 14px;
+    font-size:10px;
+    color:var(--dim);
+    background:#0a0e14;
+    cursor:pointer;
+    user-select:none;
+    border-top:1px dashed #21262d;
+    border-bottom:1px dashed #21262d;
+    text-align:center;
+}
+.disasm-fold:hover { color:var(--txt); background:#0d1117; }
