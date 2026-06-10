@@ -709,6 +709,17 @@ if __name__ == '__main__':
         threading.Thread(target=_stop, daemon=True).start()
         return json.dumps({"ok": True})
 
+    # Pre-import wsgiref dependencies so PyInstaller bundles them correctly.
+    # Without this, frozen EXEs crash with "No module named 'http.server'"
+    # because PyInstaller's static analysis misses wsgiref's dynamic imports.
+    try:
+        import wsgiref.simple_server   # noqa: F401  — needed by Bottle/wsgiref
+        import http.server             # noqa: F401  — needed by wsgiref
+        import http.client             # noqa: F401
+        import socketserver            # noqa: F401
+    except ImportError:
+        pass  # Already imported or running in a non-frozen environment
+
     threading.Thread(target=open_browser, args=(PORT,), daemon=True).start()
-    run(app, host='localhost', port=PORT, quiet=True,
+    run(app, host='localhost', port=PORT, server='wsgiref', quiet=True,
         max_request_size=256 * 1024 * 1024)
